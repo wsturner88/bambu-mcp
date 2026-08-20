@@ -1,0 +1,14 @@
+# Pull-and-run deployment — no build needed.
+# 1) put config.yml (from app/config.example.yml) and .env (from .env.example) next to this file
+# 2) docker compose -f docker-compose.ghcr.yml up -d
+services:
+  bambu-mcp:
+    image: ghcr.io/wsturner88/bambu-mcp:latest
+    container_name: bambu-mcp
+    restart: unless-stopped
+    ports:
+      - "8271:8271"
+    env_file: .env
+    volumes:
+      - ./config.yml:/app/config.yml:ro
+      - ./data:/data

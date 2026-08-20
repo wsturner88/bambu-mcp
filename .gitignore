@@ -1,0 +1,11 @@
+# personal / secret — never publish
+app/config.yml
+.env
+data/
+BILL-NOTES.md
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.DS_Store

@@ -1,0 +1,10 @@
+services:
+  bambu-mcp:
+    build: .
+    container_name: bambu-mcp
+    restart: unless-stopped
+    ports:
+      - "8271:8271"
+    env_file: .env          # P1S_ACCESS_CODE / A1_ACCESS_CODE live here, on the host only
+    volumes:
+      - ./data:/data        # 3MF metadata cache (survives rebuilds)

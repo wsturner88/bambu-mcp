@@ -1,0 +1,41 @@
+# bambu-mcp fleet config — copy to config.yml and edit for your printers.
+# Access codes are NOT stored here: they come from environment variables
+# (see .env.example) so this file is safe to commit/share.
+
+printers:
+  - name: P1S                        # short name agents will use
+    model: "Bambu Lab P1S"
+    ip: 192.168.1.100                # printer's LAN IP (set a DHCP reservation!)
+    serial: 01PXXXXXXXXXXXX          # see README: "Finding your serial"
+    access_code_env: P1S_ACCESS_CODE
+    # P1-series NOTE: print-start over local MQTT requires LAN-only mode.
+    # On firmware >= 01.08.03 you must ALSO enable Developer Mode
+    # (Settings -> Network -> LAN Only Mode -> Developer Mode).
+
+  - name: A1
+    model: "Bambu Lab A1"
+    ip: 192.168.1.101
+    serial: 039XXXXXXXXXXXX
+    access_code_env: A1_ACCESS_CODE
+
+# Palette — the ONLY hex definitions in the system. Every tool answers with
+# these NAMES, never raw hues (colorblind-safe by design). Match these hexes
+# to the filament colors configured in your slicer for perfect AMS mapping.
+palette:
+  GREEN:  "21FF06"
+  ORANGE: "FD8008"
+  RED:    "C12E1F"
+  BLUE:   "0A2989"
+  BLACK:  "000000"
+  WHITE:  "FFFFFF"
+
+# Part-color conventions (optional). If a filename matches `match` (regex,
+# case-insensitive), the server recommends that color at print start — and
+# flags files sliced in the wrong color as probable slicing errors.
+conventions:
+  - match: "ryobi"
+    color: GREEN
+  - match: "vetus"
+    color: ORANGE
+  # - match: "gift|present"
+  #   color: "RED|GREEN"      # multiple acceptable colors: pipe-separated
