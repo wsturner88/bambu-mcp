@@ -346,6 +346,11 @@ async def _dashboard(request: Request):
         return HTMLResponse(fh.read())
 
 
+@mcp.custom_route("/api/ui-version", methods=["GET"])
+async def _api_ui_version(request: Request):
+    return JSONResponse({"v": str(os.path.getmtime(_DASH_PATH))})
+
+
 @mcp.custom_route("/api/fleet", methods=["GET"])
 async def _api_fleet(request: Request):
     out = []

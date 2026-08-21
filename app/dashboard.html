@@ -307,6 +307,16 @@ async function act(action){
 }
 
 function closeModal(){ $('modal').classList.remove('on'); }
+
+let UIV = null;
+setInterval(async ()=>{
+  try{
+    const r = await fetch('/api/ui-version'); const d = await r.json();
+    if(UIV === null) UIV = d.v;
+    else if(d.v !== UIV) location.reload();
+  }catch(e){}
+}, 60000);
+
 show('home');
 </script>
 </body>
