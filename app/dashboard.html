@@ -196,20 +196,32 @@ async function askPrint(encName){
     <button class="big" onclick="closeModal()">Close</button>`; return; }
   const notes = (d.notes||[]).map(n=>`<div class="warnbox">${n}</div>`).join('');
   $('mbody').innerHTML = `
-    <h2>Start print on ${CUR}?</h2>
-    <div style="font-size:18px;font-weight:700">${d.file.replace('.gcode.3mf','')}</div>
+    <h2 style="color:#f5b73d;font-size:24px">&#9888; ARE YOU SURE YOU WANT TO START A PRINT?</h2>
+    <div style="font-size:19px;font-weight:800;margin-top:4px">${d.file.replace('.gcode.3mf','')} &mdash; on ${CUR}</div>
     <div class="note">${d.print_time} · ${Math.round(d.weight_g)} g</div>
     <div class="note" style="font-size:17px;color:var(--txt)">Spool: <b>${d.mapping_described}</b></div>
     ${notes}
-    <div class="toggle"><input type="checkbox" id="plateok"><label for="plateok">The build plate is CLEAR</label></div>
+    <div class="toggle" style="border:2px solid var(--warn); font-size:19px">
+      <input type="checkbox" id="plateok" onchange="armStart(this.checked)">
+      <label for="plateok">CONFIRM: THE PRINT BED IS CLEAR</label></div>
     <div class="row">
       <button class="big grow" onclick="closeModal()">Back</button>
-      <button class="big primary grow" onclick='doStart(${JSON.stringify(d.file)}, ${JSON.stringify(d.ams_mapping)}, ${JSON.stringify(d.confirm_string)})'>START PRINT</button>
+      <button class="big grow" id="startbtn" disabled
+        style="opacity:.4"
+        onclick='doStart(${JSON.stringify(d.file)}, ${JSON.stringify(d.ams_mapping)}, ${JSON.stringify(d.confirm_string)})'>START PRINT</button>
     </div>`;
 }
 
+function armStart(on){
+  const b = $('startbtn');
+  b.disabled = !on;
+  b.style.opacity = on ? '1' : '.4';
+  b.className = on ? 'big grow primary' : 'big grow';
+  b.textContent = on ? 'START PRINT NOW' : 'START PRINT';
+}
+
 async function doStart(filename, mapping, confirm){
-  if(!$('plateok').checked){ alert('Confirm the plate is clear first.'); return; }
+  if(!$('plateok').checked){ return; }
   $('mbody').innerHTML = '<h2>Starting…</h2>';
   const r = await fetch(`/api/printer/${CUR}/start`, {method:'POST',
     headers:{'Content-Type':'application/json'},
