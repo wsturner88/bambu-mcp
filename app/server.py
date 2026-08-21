@@ -298,5 +298,98 @@ def delete_sd_file(printer: str, filename: str, confirm: str) -> str:
     return f"deleted {filename}"
 
 
+# ------------------------------------------------------------- dashboard web UI
+# Same brain, second face: a touch dashboard served from this container.
+# All write paths reuse the exact gates the MCP tools enforce.
+
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, JSONResponse
+
+_DASH_PATH = os.path.join(os.path.dirname(__file__), "dashboard.html")
+
+
+@mcp.custom_route("/", methods=["GET"])
+async def _root(request: Request):
+    return HTMLResponse('<meta http-equiv="refresh" content="0; url=/dashboard">')
+
+
+@mcp.custom_route("/dashboard", methods=["GET"])
+async def _dashboard(request: Request):
+    with open(_DASH_PATH) as fh:
+        return HTMLResponse(fh.read())
+
+
+@mcp.custom_route("/api/fleet", methods=["GET"])
+async def _api_fleet(request: Request):
+    out = []
+    for prn in PRINTERS.values():
+        s = prn.snapshot()
+        out.append(s)
+    return JSONResponse(out)
+
+
+@mcp.custom_route("/api/printer/{name}", methods=["GET"])
+async def _api_printer(request: Request):
+    prn = _pick(request.path_params["name"])
+    trays = []
+    for t in prn.ams_trays():
+        trays.append({**t, "color_name": color_name(t["color"]) if t["color"] else None})
+    return JSONResponse({"snapshot": prn.snapshot(), "trays": trays,
+                         "palette": sorted(PALETTE.keys())})
+
+
+@mcp.custom_route("/api/printer/{name}/files", methods=["GET"])
+async def _api_files(request: Request):
+    refresh = request.query_params.get("refresh") == "1"
+    raw = list_sd_files(request.path_params["name"], refresh_metadata=refresh)
+    return JSONResponse(json.loads(raw))
+
+
+@mcp.custom_route("/api/printer/{name}/suggest", methods=["POST"])
+async def _api_suggest(request: Request):
+    body = await request.json()
+    raw = suggest_mapping(request.path_params["name"], body["filename"])
+    try:
+        return JSONResponse(json.loads(raw))
+    except Exception:
+        return JSONResponse({"error": raw}, status_code=400)
+
+
+@mcp.custom_route("/api/printer/{name}/start", methods=["POST"])
+async def _api_start(request: Request):
+    body = await request.json()
+    if not body.get("plate_clear"):
+        return JSONResponse({"error": "plate_clear must be confirmed"}, status_code=400)
+    raw = start_print(request.path_params["name"], body["filename"],
+                      body["ams_mapping"], body["confirm"])
+    if raw.startswith("REFUSED"):
+        return JSONResponse({"error": raw}, status_code=409)
+    return JSONResponse(json.loads(raw))
+
+
+@mcp.custom_route("/api/printer/{name}/action", methods=["POST"])
+async def _api_action(request: Request):
+    body = await request.json()
+    name = request.path_params["name"]
+    act = body.get("action")
+    if act == "cancel":
+        return JSONResponse({"result": cancel_print(name)})
+    if act == "pause":
+        return JSONResponse({"result": pause_print(name)})
+    if act == "resume":
+        return JSONResponse({"result": resume_print(name)})
+    if act in ("light_on", "light_off"):
+        return JSONResponse({"result": chamber_light(name, act == "light_on")})
+    return JSONResponse({"error": f"unknown action {act}"}, status_code=400)
+
+
+@mcp.custom_route("/api/printer/{name}/tray", methods=["POST"])
+async def _api_tray(request: Request):
+    body = await request.json()
+    res = set_tray(request.path_params["name"], int(body["tray_id"]),
+                   body["material"], body["color"])
+    return JSONResponse({"result": res})
+
+
 if __name__ == "__main__":
     mcp.run(transport="streamable-http")

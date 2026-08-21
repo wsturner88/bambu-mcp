@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Print Hub</title>
+<style>
+  :root {
+    --bg:#14161a; --card:#1e2228; --card2:#262c34; --line:#333a44;
+    --txt:#f2f4f7; --dim:#9aa4b2; --ok:#1f6f43; --warn:#8a6116; --bad:#8a2a22;
+    --accent:#2f6fb3;
+  }
+  * { box-sizing:border-box; margin:0; -webkit-tap-highlight-color:transparent; user-select:none; }
+  body { background:var(--bg); color:var(--txt); font-family:system-ui,-apple-system,sans-serif;
+         width:1024px; height:600px; overflow:hidden; }
+  .screen { display:none; height:600px; padding:14px; flex-direction:column; }
+  .screen.on { display:flex; }
+  h1 { font-size:22px; font-weight:600; }
+  .row { display:flex; align-items:center; gap:12px; }
+  .grow { flex:1; }
+  .chip { font-size:15px; font-weight:700; padding:6px 14px; border-radius:16px; white-space:nowrap; }
+  .chip.run  { background:var(--ok); }
+  .chip.idle { background:#3a4350; }
+  .chip.warn { background:var(--warn); }
+  .chip.bad  { background:var(--bad); }
+  button { font-family:inherit; font-size:17px; font-weight:600; color:var(--txt);
+           background:var(--card2); border:1px solid var(--line); border-radius:12px;
+           padding:12px 18px; min-height:52px; }
+  button:active { background:#33404e; }
+  button.primary { background:var(--accent); border-color:var(--accent); }
+  button.danger  { background:var(--bad); border-color:var(--bad); }
+  button.big { font-size:20px; min-height:60px; }
+
+  /* home */
+  #fleet { display:grid; grid-template-columns:repeat(3,1fr); gap:14px; flex:1; margin-top:12px; }
+  .pcard { background:var(--card); border:1px solid var(--line); border-radius:16px;
+           padding:18px; display:flex; flex-direction:column; gap:10px; }
+  .pcard .pname { font-size:26px; font-weight:700; }
+  .pcard .job { font-size:16px; color:var(--dim); min-height:40px; }
+  .bar { height:14px; background:#0d0f12; border-radius:7px; overflow:hidden; }
+  .bar i { display:block; height:100%; background:var(--accent); }
+  .pcard .meta { font-size:15px; color:var(--dim); }
+
+  /* printer view */
+  #files { flex:1; overflow-y:auto; margin-top:10px; }
+  .frow { display:flex; align-items:center; gap:12px; background:var(--card);
+          border:1px solid var(--line); border-radius:12px; padding:10px 14px; margin-bottom:8px; }
+  .frow .fname { font-size:17px; font-weight:600; }
+  .frow .fmeta { font-size:14px; color:var(--dim); }
+  .trays { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin-top:10px; }
+  .tray { background:var(--card); border:1px solid var(--line); border-radius:12px;
+          padding:10px; text-align:center; }
+  .tray .tcol { font-size:19px; font-weight:800; }
+  .tray .tmat { font-size:13px; color:var(--dim); margin-bottom:6px; }
+
+  /* modal */
+  #modal { position:fixed; inset:0; background:rgba(0,0,0,.7); display:none;
+           align-items:center; justify-content:center; }
+  #modal.on { display:flex; }
+  .mbox { background:var(--card); border:1px solid var(--line); border-radius:16px;
+          padding:22px; width:640px; max-height:560px; overflow-y:auto; }
+  .mbox h2 { font-size:20px; margin-bottom:12px; }
+  .colorgrid { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; }
+  .toggle { display:flex; align-items:center; gap:10px; font-size:18px; font-weight:600;
+            padding:12px; background:var(--card2); border-radius:12px; margin:14px 0; }
+  .toggle input { width:26px; height:26px; }
+  .note { font-size:15px; color:var(--dim); margin:8px 0; }
+  .warnbox { background:#3d2f10; border:1px solid var(--warn); border-radius:10px;
+             padding:10px 12px; font-size:15px; margin:8px 0; }
+</style>
+</head>
+<body>
+
+<section id="home" class="screen on">
+  <div class="row"><h1>Print Hub</h1><span class="grow"></span><span id="clock" style="color:var(--dim);font-size:18px"></span></div>
+  <div id="fleet"></div>
+</section>
+
+<section id="printer" class="screen">
+  <div class="row">
+    <button onclick="show('home')">&#8592; Fleet</button>
+    <h1 id="p-title">P1S</h1>
+    <span id="p-chip" class="chip idle">IDLE</span>
+    <span class="grow"></span>
+    <button onclick="act('light_on')">Light on</button>
+    <button onclick="act('light_off')">Light off</button>
+    <button id="p-pause" onclick="act('pause')">Pause</button>
+    <button id="p-resume" onclick="act('resume')">Resume</button>
+    <button class="danger" onclick="askCancel()">Cancel</button>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <span id="p-job" style="font-size:16px;color:var(--dim)"></span>
+    <span class="grow"></span>
+    <span id="p-temps" style="font-size:15px;color:var(--dim)"></span>
+  </div>
+  <div class="bar" style="margin-top:8px"><i id="p-bar" style="width:0%"></i></div>
+  <div class="trays" id="p-trays"></div>
+  <div class="row" style="margin-top:10px">
+    <span style="font-size:16px;font-weight:700">Jobs on SD card</span>
+    <span class="grow"></span>
+    <button onclick="loadFiles(true)" style="min-height:44px;font-size:14px">Refresh details (slow)</button>
+  </div>
+  <div id="files"></div>
+</section>
+
+<div id="modal"><div class="mbox" id="mbody"></div></div>
+
+<script>
+const $ = id => document.getElementById(id);
+let CUR = null, POLL = null;
+
+function show(id){ document.querySelectorAll('.screen').forEach(s=>s.classList.remove('on'));
+  $(id).classList.add('on'); clearInterval(POLL);
+  if(id==='home'){ fleet(); POLL=setInterval(fleet,5000); }
+  if(id==='printer'){ pview(); POLL=setInterval(pview,5000); } }
+
+function chipFor(state){
+  if(state==='RUNNING'||state==='PREPARE') return ['run','PRINTING'];
+  if(state==='PAUSE') return ['warn','PAUSED'];
+  if(state==='FAILED') return ['idle','IDLE (last job cancelled)'];
+  if(state==='FINISH') return ['idle','IDLE (done)'];
+  if(state==='UNKNOWN') return ['bad','OFFLINE'];
+  return ['idle', state||'IDLE']; }
+
+async function fleet(){
+  try{
+    const r = await fetch('/api/fleet'); const data = await r.json();
+    $('clock').textContent = new Date().toLocaleTimeString([], {hour:'numeric',minute:'2-digit'});
+    $('fleet').innerHTML = data.map(p=>{
+      const [cls,word] = chipFor(p.connected ? p.state : 'UNKNOWN');
+      const pct = (p.state==='RUNNING') ? p.percent : 0;
+      const left = (p.state==='RUNNING' && p.remaining_min) ? `${Math.floor(p.remaining_min/60)}h ${p.remaining_min%60}m left` : '';
+      return `<div class="pcard" onclick="openPrinter('${p.printer}')">
+        <div class="row"><span class="pname">${p.printer}</span><span class="grow"></span>
+          <span class="chip ${cls}">${word}</span></div>
+        <div class="job">${p.job ? p.job : 'No job'}</div>
+        <div class="bar"><i style="width:${pct||0}%"></i></div>
+        <div class="meta">${p.state==='RUNNING' ? (p.percent+'% · '+left) : ''}</div>
+        <div class="meta">Nozzle ${Math.round(p.nozzle_c||0)}&deg; · Bed ${Math.round(p.bed_c||0)}&deg;</div>
+      </div>`;
+    }).join('') + `<div class="pcard" style="opacity:.55"><div class="row"><span class="pname">MK4</span>
+        <span class="grow"></span><span class="chip bad">OFFLINE</span></div>
+        <div class="job">Coming soon — via OctoPrint</div><div class="bar"></div></div>`;
+  }catch(e){ /* server restarting; keep polling */ }
+}
+
+function openPrinter(name){ CUR = name; show('printer'); loadFiles(false); }
+
+async function pview(){
+  try{
+    const r = await fetch('/api/printer/'+CUR); const d = await r.json();
+    const s = d.snapshot;
+    $('p-title').textContent = CUR;
+    const [cls,word] = chipFor(s.connected ? s.state : 'UNKNOWN');
+    $('p-chip').className = 'chip '+cls; $('p-chip').textContent = word;
+    $('p-job').textContent = s.job ? (s.job + (s.state==='RUNNING' ? ` — layer ${s.layer}` : '')) : '';
+    $('p-temps').textContent = `Nozzle ${Math.round(s.nozzle_c||0)}° / ${Math.round(s.nozzle_target_c||0)}° · Bed ${Math.round(s.bed_c||0)}° / ${Math.round(s.bed_target_c||0)}°`;
+    $('p-bar').style.width = (s.state==='RUNNING' ? s.percent : 0) + '%';
+    $('p-pause').style.display  = (s.state==='RUNNING') ? '' : 'none';
+    $('p-resume').style.display = (s.state==='PAUSE') ? '' : 'none';
+    window._palette = d.palette;
+    $('p-trays').innerHTML = d.trays.map(t=>`
+      <div class="tray"><div style="font-size:13px;color:var(--dim)">Slot ${t.slot_1based}</div>
+        <div class="tcol">${t.color_name||'EMPTY'}</div>
+        <div class="tmat">${t.type||'&mdash;'}</div>
+        <button style="min-height:44px;font-size:14px;width:100%" onclick="askTray(${t.tray},'${t.type||'PETG'}')">Change</button>
+      </div>`).join('');
+  }catch(e){}
+}
+
+async function loadFiles(refresh){
+  $('files').innerHTML = '<div class="note">Loading' + (refresh?' — reading files off the printer, this takes a while…':'…') + '</div>';
+  const r = await fetch(`/api/printer/${CUR}/files` + (refresh?'?refresh=1':''));
+  const files = await r.json();
+  files.sort((a,b)=>(a.print_time||'zz').localeCompare(b.print_time||'zz'));
+  $('files').innerHTML = files.map(f=>{
+    const fil = (f.filaments||[]).map(x=>x.color_name+' '+x.type).join(' + ') || 'details not loaded';
+    const warn = f.convention_warning ? `<span class="chip warn" style="font-size:12px">FIX AT START</span>` :
+                 (f.filaments ? `<span class="chip run" style="font-size:12px">READY</span>` : '');
+    return `<div class="frow">
+      <div class="grow"><div class="fname">${f.name.replace('.gcode.3mf','')}</div>
+        <div class="fmeta">${f.print_time||'?'} · ${f.weight_g?Math.round(f.weight_g)+' g':''} · wants ${fil}</div></div>
+      ${warn}
+      <button class="primary" onclick="askPrint('${encodeURIComponent(f.name)}')">Print</button>
+    </div>`;
+  }).join('');
+}
+
+async function askPrint(encName){
+  const filename = decodeURIComponent(encName);
+  $('mbody').innerHTML = '<h2>Checking spools…</h2>'; $('modal').classList.add('on');
+  const r = await fetch(`/api/printer/${CUR}/suggest`, {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify({filename})});
+  const d = await r.json();
+  if(d.error){ $('mbody').innerHTML = `<h2>Cannot print</h2><div class="note">${d.error}</div>
+    <button class="big" onclick="closeModal()">Close</button>`; return; }
+  const notes = (d.notes||[]).map(n=>`<div class="warnbox">${n}</div>`).join('');
+  $('mbody').innerHTML = `
+    <h2>Start print on ${CUR}?</h2>
+    <div style="font-size:18px;font-weight:700">${d.file.replace('.gcode.3mf','')}</div>
+    <div class="note">${d.print_time} · ${Math.round(d.weight_g)} g</div>
+    <div class="note" style="font-size:17px;color:var(--txt)">Spool: <b>${d.mapping_described}</b></div>
+    ${notes}
+    <div class="toggle"><input type="checkbox" id="plateok"><label for="plateok">The build plate is CLEAR</label></div>
+    <div class="row">
+      <button class="big grow" onclick="closeModal()">Back</button>
+      <button class="big primary grow" onclick='doStart(${JSON.stringify(d.file)}, ${JSON.stringify(d.ams_mapping)}, ${JSON.stringify(d.confirm_string)})'>START PRINT</button>
+    </div>`;
+}
+
+async function doStart(filename, mapping, confirm){
+  if(!$('plateok').checked){ alert('Confirm the plate is clear first.'); return; }
+  $('mbody').innerHTML = '<h2>Starting…</h2>';
+  const r = await fetch(`/api/printer/${CUR}/start`, {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({filename, ams_mapping:mapping, confirm, plate_clear:true})});
+  const d = await r.json();
+  $('mbody').innerHTML = d.error
+    ? `<h2>Refused</h2><div class="note">${d.error}</div><button class="big" onclick="closeModal()">Close</button>`
+    : `<h2>&#9989; Print started</h2><div class="note">State: ${d.state_after_8s} — ${d.job}</div>
+       <button class="big primary" onclick="closeModal()">Done</button>`;
+  pview();
+}
+
+function askTray(tray, mat){
+  const colors = (window._palette||['GREEN','ORANGE','RED','BLUE','BLACK','WHITE']);
+  $('mbody').innerHTML = `<h2>Slot ${tray+1}: what spool is loaded?</h2>
+    <div class="note">Material: ${mat} — tap the color NAME on the spool label</div>
+    <div class="colorgrid">` +
+    colors.map(c=>`<button class="big" onclick="doTray(${tray},'${mat}','${c}')">${c}</button>`).join('') +
+    `</div><button class="big" style="margin-top:12px;width:100%" onclick="closeModal()">Back</button>`;
+  $('modal').classList.add('on');
+}
+
+async function doTray(tray, mat, color){
+  $('mbody').innerHTML = '<h2>Updating tray…</h2>';
+  await fetch(`/api/printer/${CUR}/tray`, {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({tray_id:tray, material:mat, color})});
+  closeModal(); pview();
+}
+
+function askCancel(){
+  $('mbody').innerHTML = `<h2>Cancel the current print?</h2>
+    <div class="note">This stops the job immediately. It cannot be resumed.</div>
+    <div class="row"><button class="big grow" onclick="closeModal()">Keep printing</button>
+    <button class="big danger grow" onclick="doCancel()">CANCEL PRINT</button></div>`;
+  $('modal').classList.add('on');
+}
+async function doCancel(){ $('mbody').innerHTML='<h2>Cancelling…</h2>';
+  await act('cancel'); closeModal(); }
+
+async function act(action){
+  const r = await fetch(`/api/printer/${CUR}/action`, {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify({action})});
+  pview(); return r.json();
+}
+
+function closeModal(){ $('modal').classList.remove('on'); }
+show('home');
+</script>
+</body>
+</html>
