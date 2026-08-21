@@ -186,20 +186,37 @@ async function loadFiles(refresh){
   }).join('');
 }
 
+let SEL = null;
+
 async function askPrint(encName){
   const filename = decodeURIComponent(encName);
   $('mbody').innerHTML = '<h2>Checking spools…</h2>'; $('modal').classList.add('on');
-  const r = await fetch(`/api/printer/${CUR}/suggest`, {method:'POST',
-    headers:{'Content-Type':'application/json'}, body: JSON.stringify({filename})});
+  const [r, rp] = await Promise.all([
+    fetch(`/api/printer/${CUR}/suggest`, {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({filename})}),
+    fetch('/api/printer/'+CUR)
+  ]);
   const d = await r.json();
+  const pd = await rp.json();
   if(d.error){ $('mbody').innerHTML = `<h2>Cannot print</h2><div class="note">${d.error}</div>
     <button class="big" onclick="closeModal()">Close</button>`; return; }
   const notes = (d.notes||[]).map(n=>`<div class="warnbox">${n}</div>`).join('');
+  const trays = (pd.trays||[]).filter(t=>t.type);
+  const pickable = trays.length > 0 && (d.ams_mapping||[]).length === 1;
+  SEL = pickable ? d.ams_mapping[0] : null;
+  window._file = d.file;
+  const spoolHtml = pickable ? `
+    <div class="note" style="font-size:17px;color:var(--txt);margin-top:10px"><b>Tap the spool to print with:</b></div>
+    <div class="colorgrid" id="spoolgrid" style="grid-template-columns:repeat(${Math.min(trays.length,4)},1fr)">` +
+      trays.map(t=>`<button class="big" id="spool${t.tray}" onclick="pickSpool(${t.tray})"
+        style="min-height:74px;line-height:1.25">Slot ${t.slot_1based}<br>${t.color_name} ${t.type}${d.ams_mapping[0]===t.tray?'<br>&#9733; suggested':''}</button>`).join('') +
+    `</div>`
+    : `<div class="note" style="font-size:17px;color:var(--txt)">Spool: <b>${d.mapping_described}</b></div>`;
   $('mbody').innerHTML = `
     <h2 style="color:#f5b73d;font-size:24px">&#9888; ARE YOU SURE YOU WANT TO START A PRINT?</h2>
     <div style="font-size:19px;font-weight:800;margin-top:4px">${d.file.replace('.gcode.3mf','')} &mdash; on ${CUR}</div>
     <div class="note">${d.print_time||''}${d.weight_g?' · '+Math.round(d.weight_g)+' g':''}</div>
-    <div class="note" style="font-size:17px;color:var(--txt)">Spool: <b>${d.mapping_described}</b></div>
+    ${spoolHtml}
     ${notes}
     <div class="toggle" style="border:2px solid var(--warn); font-size:19px">
       <input type="checkbox" id="plateok" onchange="armStart(this.checked)">
@@ -208,8 +225,29 @@ async function askPrint(encName){
       <button class="big grow" onclick="closeModal()">Back</button>
       <button class="big grow" id="startbtn" disabled
         style="opacity:.4"
-        onclick='doStart(${JSON.stringify(d.file)}, ${JSON.stringify(d.ams_mapping)}, ${JSON.stringify(d.confirm_string)})'>START PRINT</button>
+        onclick='startSelected(${JSON.stringify(d.ams_mapping)}, ${JSON.stringify(d.confirm_string)})'>START PRINT</button>
     </div>`;
+  if(pickable) highlightSpool();
+}
+
+function pickSpool(tray){ SEL = tray; highlightSpool(); }
+
+function highlightSpool(){
+  document.querySelectorAll('[id^=spool]').forEach(b=>{
+    const on = b.id === 'spool'+SEL;
+    b.style.border = on ? '3px solid var(--accent)' : '1px solid var(--line)';
+    b.style.background = on ? '#1d3b5c' : 'var(--card2)';
+  });
+}
+
+function startSelected(suggestedMapping, suggestedConfirm){
+  if(SEL !== null){
+    const mapping = [SEL];
+    const confirm = `${window._file}|${CUR}|${SEL}`;
+    doStart(window._file, mapping, confirm);
+  } else {
+    doStart(window._file, suggestedMapping, suggestedConfirm);
+  }
 }
 
 function armStart(on){
