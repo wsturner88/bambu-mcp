@@ -18,7 +18,7 @@ import time
 import yaml
 from mcp.server.fastmcp import FastMCP
 
-from bambu import BambuPrinter, parse_3mf_meta
+from bambu import BambuPrinter, OctoPrintPrinter, parse_3mf_meta
 
 CFG_PATH = os.environ.get("BAMBU_MCP_CONFIG", os.path.join(os.path.dirname(__file__), "config.yml"))
 CACHE_PATH = os.environ.get("BAMBU_MCP_CACHE", "/data/metacache.json")
@@ -29,12 +29,19 @@ with open(CFG_PATH) as fh:
 PALETTE = {k.upper(): v.upper() for k, v in CFG["palette"].items()}
 RULES = CFG.get("conventions", [])
 
-PRINTERS: dict[str, BambuPrinter] = {}
+PRINTERS: dict = {}
 for p in CFG["printers"]:
-    code = os.environ.get(p["access_code_env"], "")
-    prn = BambuPrinter(p["name"], p["ip"], p["serial"], code, p.get("model", ""))
+    if p.get("type") == "octoprint":
+        key = os.environ.get(p["api_key_env"], "")
+        prn = OctoPrintPrinter(p["name"], p["url"], key, p.get("model", ""))
+    else:
+        code = os.environ.get(p["access_code_env"], "")
+        prn = BambuPrinter(p["name"], p["ip"], p["serial"], code, p.get("model", ""))
     PRINTERS[p["name"].lower()] = prn
     prn.connect()
+
+def _is_octo(prn):
+    return getattr(prn, "kind", "") == "octoprint"
 
 # ------------------------------------------------------------- color helpers
 
@@ -135,6 +142,8 @@ def printer_status(printer: str) -> str:
 def ams_state(printer: str) -> str:
     """AMS tray readout. Colors are given as NAMES, never hues (colorblind-safe)."""
     prn = _pick(printer)
+    if _is_octo(prn):
+        return f"{prn.name} has no AMS — it prints the loaded filament."
     rows = []
     for t in prn.ams_trays():
         if t["type"]:
@@ -151,6 +160,8 @@ def list_sd_files(printer: str, refresh_metadata: bool = False) -> str:
     refresh_metadata=true, downloads uncached files to extract print time,
     weight and filament colors (slow — ~30s per file on the P1S)."""
     prn = _pick(printer)
+    if _is_octo(prn):
+        return json.dumps(prn.files(), indent=2)
     files = prn.sd_list()
     out = []
     for f in files:
@@ -174,6 +185,20 @@ def suggest_mapping(printer: str, filename: str) -> str:
     """Work out which AMS tray(s) a job should use — applying the user's part-color
     conventions — and return the exact confirm string start_print requires."""
     prn = _pick(printer)
+    if _is_octo(prn):
+        files = {f["name"]: f for f in prn.files()}
+        if filename not in files:
+            return f"'{filename}' not on {prn.name}."
+        f = files[filename]
+        return json.dumps({
+            "file": filename, "printer": prn.name,
+            "print_time": f.get("print_time"), "weight_g": None,
+            "ams_mapping": [], "mapping_described": "the loaded filament (no AMS on this printer)",
+            "notes": ["This printer prints with whatever filament is physically loaded — check it."],
+            "confirm_string": f"{filename}|{prn.name}|",
+            "next_step": ("Ask the human: (1) is the build plate clear? (2) is the right "
+                          "filament loaded? Then call start_print with this confirm_string."),
+        }, indent=2)
     files = {f["name"]: f for f in prn.sd_list()}
     if filename not in files:
         return f"'{filename}' not on {prn.name}'s SD card."
@@ -280,6 +305,8 @@ def set_tray(printer: str, tray_id: int, material: str, color: str) -> str:
     """Register a tray after a spool swap. `color` is a palette NAME (GREEN,
     ORANGE, RED, BLUE, BLACK, WHITE...) — the server supplies the exact hex;
     nobody ever has to pick or verify a hue by eye."""
+    if _is_octo(_pick(printer)):
+        return f"{printer} has no AMS trays to set."
     name = color.upper()
     if name not in PALETTE:
         return f"Unknown color '{color}'. Palette: {', '.join(PALETTE)}"

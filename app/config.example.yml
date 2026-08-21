@@ -18,6 +18,13 @@ printers:
     serial: 039XXXXXXXXXXXX
     access_code_env: A1_ACCESS_CODE
 
+  # A printer driven by OctoPrint (e.g. a Prusa on USB) — REST API, no AMS:
+  # - name: MK4
+  #   model: "Prusa MK4S"
+  #   type: octoprint
+  #   url: http://192.168.1.102
+  #   api_key_env: MK4_API_KEY     # OctoPrint Settings -> API (or an Application Key)
+
 # Palette — the ONLY hex definitions in the system. Every tool answers with
 # these NAMES, never raw hues (colorblind-safe by design). Match these hexes
 # to the filament colors configured in your slicer for perfect AMS mapping.

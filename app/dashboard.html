@@ -138,9 +138,7 @@ async function fleet(){
         <div class="meta">${p.state==='RUNNING' ? (p.percent+'% · '+left) : ''}</div>
         <div class="meta">Nozzle ${Math.round(p.nozzle_c||0)}&deg; · Bed ${Math.round(p.bed_c||0)}&deg;</div>
       </div>`;
-    }).join('') + `<div class="pcard" style="opacity:.55"><div class="row"><span class="pname">MK4</span>
-        <span class="grow"></span><span class="chip bad">OFFLINE</span></div>
-        <div class="job">Coming soon — via OctoPrint</div><div class="bar"></div></div>`;
+    }).join('');
   }catch(e){ /* server restarting; keep polling */ }
 }
 
@@ -174,12 +172,14 @@ async function loadFiles(refresh){
   const files = await r.json();
   files.sort((a,b)=>(a.print_time||'zz').localeCompare(b.print_time||'zz'));
   $('files').innerHTML = files.map(f=>{
-    const fil = (f.filaments||[]).map(x=>x.color_name+' '+x.type).join(' + ') || 'details not loaded';
+    const isOcto = !!f.origin;
+    const fil = isOcto ? 'uses the loaded filament'
+      : 'wants ' + ((f.filaments||[]).map(x=>x.color_name+' '+x.type).join(' + ') || 'details not loaded');
     const warn = f.convention_warning ? `<span class="chip warn" style="font-size:12px">FIX AT START</span>` :
                  (f.filaments ? `<span class="chip run" style="font-size:12px">READY</span>` : '');
     return `<div class="frow">
-      <div class="grow"><div class="fname">${f.name.replace('.gcode.3mf','')}</div>
-        <div class="fmeta">${f.print_time||'?'} · ${f.weight_g?Math.round(f.weight_g)+' g':''} · wants ${fil}</div></div>
+      <div class="grow"><div class="fname">${f.name.replace('.gcode.3mf','').replace(/\.b?gcode$/,'')}</div>
+        <div class="fmeta">${f.print_time||'?'} · ${f.weight_g?Math.round(f.weight_g)+' g · ':''}${fil}</div></div>
       ${warn}
       <button class="primary" onclick="askPrint('${encodeURIComponent(f.name)}')">Print</button>
     </div>`;
@@ -198,7 +198,7 @@ async function askPrint(encName){
   $('mbody').innerHTML = `
     <h2 style="color:#f5b73d;font-size:24px">&#9888; ARE YOU SURE YOU WANT TO START A PRINT?</h2>
     <div style="font-size:19px;font-weight:800;margin-top:4px">${d.file.replace('.gcode.3mf','')} &mdash; on ${CUR}</div>
-    <div class="note">${d.print_time} · ${Math.round(d.weight_g)} g</div>
+    <div class="note">${d.print_time||''}${d.weight_g?' · '+Math.round(d.weight_g)+' g':''}</div>
     <div class="note" style="font-size:17px;color:var(--txt)">Spool: <b>${d.mapping_described}</b></div>
     ${notes}
     <div class="toggle" style="border:2px solid var(--warn); font-size:19px">

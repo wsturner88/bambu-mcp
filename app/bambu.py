@@ -267,3 +267,118 @@ class BambuPrinter:
         f = self._ftps()
         f.delete(filename)
         f.quit()
+
+
+# ---------------------------------------------------------------- OctoPrint driver
+# For printers driven by OctoPrint (e.g. a Prusa MK4 on USB). Same read surface
+# as BambuPrinter where it makes sense; no AMS, start goes through the job API.
+
+import urllib.request
+
+
+class OctoPrintPrinter:
+    kind = "octoprint"
+
+    def __init__(self, name, url, api_key, model=""):
+        self.name, self.url, self.api_key, self.model = name, url.rstrip("/"), api_key, model
+        self._last = {}
+        self._last_ts = 0.0
+        self._ok = False
+
+    def _get(self, path, timeout=4):
+        req = urllib.request.Request(self.url + path,
+                                     headers={"X-Api-Key": self.api_key})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read())
+
+    def _post(self, path, payload, timeout=8):
+        req = urllib.request.Request(self.url + path, method="POST",
+                                     data=json.dumps(payload).encode(),
+                                     headers={"X-Api-Key": self.api_key,
+                                              "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status
+
+    def connect(self):  # parity with BambuPrinter; OctoPrint is polled, not streamed
+        pass
+
+    def refresh(self, wait=0):
+        pass
+
+    def snapshot(self) -> dict:
+        now = time.time()
+        if now - self._last_ts > 3:
+            try:
+                p = self._get("/api/printer?exclude=sd")
+                j = self._get("/api/job")
+                self._last = (p, j)
+                self._ok = True
+            except Exception:
+                self._ok = False
+            self._last_ts = now
+        if not self._ok or not self._last:
+            return {"printer": self.name, "connected": False, "state": "UNKNOWN",
+                    "job": "", "percent": None, "remaining_min": None, "layer": "",
+                    "nozzle_c": None, "nozzle_target_c": None, "bed_c": None,
+                    "bed_target_c": None, "print_error": 0, "sdcard": None,
+                    "age_seconds": None}
+        p, j = self._last
+        flags = p.get("state", {}).get("flags", {})
+        if flags.get("printing"):
+            state = "RUNNING"
+        elif flags.get("paused") or flags.get("pausing"):
+            state = "PAUSE"
+        elif flags.get("error") or flags.get("closedOrError"):
+            state = "UNKNOWN"
+        else:
+            state = "IDLE"
+        temps = p.get("temperature", {})
+        left = j.get("progress", {}).get("printTimeLeft")
+        return {
+            "printer": self.name, "connected": True, "state": state,
+            "job": (j.get("job", {}).get("file", {}).get("name") or "").replace(".gcode", ""),
+            "percent": round(j.get("progress", {}).get("completion") or 0),
+            "remaining_min": round(left / 60) if left else None,
+            "layer": "",
+            "nozzle_c": temps.get("tool0", {}).get("actual"),
+            "nozzle_target_c": temps.get("tool0", {}).get("target"),
+            "bed_c": temps.get("bed", {}).get("actual"),
+            "bed_target_c": temps.get("bed", {}).get("target"),
+            "print_error": 1 if flags.get("error") else 0,
+            "sdcard": None,
+            "age_seconds": round(time.time() - self._last_ts),
+        }
+
+    def ams_trays(self) -> list:
+        return []
+
+    def files(self) -> list:
+        out = []
+        data = self._get("/api/files?recursive=true", timeout=10)
+
+        def walk(items):
+            for it in items:
+                if it.get("type") == "folder":
+                    walk(it.get("children", []))
+                elif it.get("name", "").lower().endswith((".gcode", ".bgcode")):
+                    ana = it.get("gcodeAnalysis", {})
+                    secs = ana.get("estimatedPrintTime")
+                    fil = ana.get("filament", {}).get("tool0", {})
+                    out.append({
+                        "name": it.get("path", it["name"]),
+                        "size": it.get("size", 0),
+                        "modified": it.get("date"),
+                        "print_seconds": secs,
+                        "print_time": f"{int(secs)//3600}h{(int(secs)%3600)//60:02d}m" if secs else None,
+                        "filament_mm": fil.get("length"),
+                        "origin": it.get("origin", "local"),
+                    })
+        walk(data.get("files", []))
+        return out
+
+    def start_print(self, filename, ams_mapping=None, origin="local"):
+        self._post(f"/api/files/{origin}/{filename}", {"command": "select", "print": True})
+
+    def stop(self):   self._post("/api/job", {"command": "cancel"})
+    def pause(self):  self._post("/api/job", {"command": "pause", "action": "pause"})
+    def resume(self): self._post("/api/job", {"command": "pause", "action": "resume"})
