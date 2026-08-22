@@ -25,6 +25,11 @@ import zipfile
 from ftplib import FTP_TLS
 
 
+class PrinterError(Exception):
+    """Raised for a printer/backend failure that should be shown to a human,
+    not surfaced as an unhandled exception / 500."""
+
+
 # ---------------------------------------------------------------- FTPS (implicit)
 
 class ImplicitFTPTLS(FTP_TLS):
@@ -84,6 +89,8 @@ def parse_3mf_meta(data: bytes) -> dict:
 # ---------------------------------------------------------------- printer driver
 
 class BambuPrinter:
+    kind = "bambu"
+
     def __init__(self, name, ip, serial, access_code, model=""):
         self.name, self.ip, self.serial = name, ip, serial
         self.access_code, self.model = access_code, model
@@ -167,6 +174,7 @@ class BambuPrinter:
             "print_error": p.get("print_error", 0),
             "sdcard": p.get("sdcard"),
             "age_seconds": round(time.time() - self.last_msg) if self.last_msg else None,
+            "kind": "bambu",
         }
 
     def ams_trays(self) -> list:
@@ -273,6 +281,7 @@ class BambuPrinter:
 # For printers driven by OctoPrint (e.g. a Prusa MK4 on USB). Same read surface
 # as BambuPrinter where it makes sense; no AMS, start goes through the job API.
 
+import urllib.error
 import urllib.request
 
 
@@ -305,23 +314,59 @@ class OctoPrintPrinter:
     def refresh(self, wait=0):
         pass
 
+    def connect_serial(self):
+        """Ask OctoPrint to open its serial connection to the printer, using its
+        saved port/baud defaults. Invalidates the snapshot cache so the next poll
+        picks up the change immediately."""
+        try:
+            self._post("/api/connection", {"command": "connect"})
+        except urllib.error.HTTPError as e:
+            raise PrinterError(f"OctoPrint refused the connect command ({e.code} {e.reason}).") from e
+        except (urllib.error.URLError, socket.timeout) as e:
+            raise PrinterError(f"Could not reach OctoPrint at {self.url}: {e}") from e
+        self._last_ts = 0.0
+        return f"connect requested for {self.name}"
+
     def snapshot(self) -> dict:
         now = time.time()
         if now - self._last_ts > 3:
+            self._last_ts = now
             try:
                 p = self._get("/api/printer?exclude=sd")
-                j = self._get("/api/job")
-                self._last = (p, j)
-                self._ok = True
+            except urllib.error.HTTPError as e:
+                if e.code == 409:
+                    # Host is reachable but OctoPrint's serial connection to the
+                    # printer is closed — not the same failure as an unreachable host.
+                    self._ok = True
+                    self._last = "DISCONNECTED"
+                else:
+                    self._ok = False
+                    self._last = None
             except Exception:
                 self._ok = False
-            self._last_ts = now
+                self._last = None
+            else:
+                try:
+                    j = self._get("/api/job")
+                except Exception:
+                    j = {}
+                self._ok = True
+                self._last = (p, j)
+
         if not self._ok or not self._last:
             return {"printer": self.name, "connected": False, "state": "UNKNOWN",
                     "job": "", "percent": None, "remaining_min": None, "layer": "",
                     "nozzle_c": None, "nozzle_target_c": None, "bed_c": None,
                     "bed_target_c": None, "print_error": 0, "sdcard": None,
-                    "age_seconds": None}
+                    "age_seconds": None, "kind": "octoprint"}
+
+        if self._last == "DISCONNECTED":
+            return {"printer": self.name, "connected": True, "state": "DISCONNECTED",
+                    "job": "", "percent": None, "remaining_min": None, "layer": "",
+                    "nozzle_c": None, "nozzle_target_c": None, "bed_c": None,
+                    "bed_target_c": None, "print_error": 0, "sdcard": None,
+                    "age_seconds": round(time.time() - self._last_ts), "kind": "octoprint"}
+
         p, j = self._last
         flags = p.get("state", {}).get("flags", {})
         if flags.get("printing"):
@@ -347,6 +392,7 @@ class OctoPrintPrinter:
             "print_error": 1 if flags.get("error") else 0,
             "sdcard": None,
             "age_seconds": round(time.time() - self._last_ts),
+            "kind": "octoprint",
         }
 
     def ams_trays(self) -> list:
@@ -377,8 +423,24 @@ class OctoPrintPrinter:
         return out
 
     def start_print(self, filename, ams_mapping=None, origin="local"):
-        self._post(f"/api/files/{origin}/{filename}", {"command": "select", "print": True})
+        try:
+            self._post(f"/api/files/{origin}/{filename}", {"command": "select", "print": True})
+        except urllib.error.HTTPError as e:
+            raise PrinterError(
+                f"OctoPrint refused the print ({e.code} {e.reason}) — is the printer "
+                "connected? Tap Connect and try again."
+            ) from e
+        except (urllib.error.URLError, socket.timeout) as e:
+            raise PrinterError(f"Could not reach OctoPrint at {self.url}: {e}") from e
 
-    def stop(self):   self._post("/api/job", {"command": "cancel"})
-    def pause(self):  self._post("/api/job", {"command": "pause", "action": "pause"})
-    def resume(self): self._post("/api/job", {"command": "pause", "action": "resume"})
+    def _job_command(self, payload, verb):
+        try:
+            self._post("/api/job", payload)
+        except urllib.error.HTTPError as e:
+            raise PrinterError(f"OctoPrint refused to {verb} ({e.code} {e.reason}).") from e
+        except (urllib.error.URLError, socket.timeout) as e:
+            raise PrinterError(f"Could not reach OctoPrint at {self.url}: {e}") from e
+
+    def stop(self):   self._job_command({"command": "cancel"}, "cancel")
+    def pause(self):  self._job_command({"command": "pause", "action": "pause"}, "pause")
+    def resume(self): self._job_command({"command": "pause", "action": "resume"}, "resume")

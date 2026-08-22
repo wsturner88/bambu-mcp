@@ -9,6 +9,7 @@ Design rules (non-negotiable):
   * One long-lived MQTT session per printer (P1 ESP32 broker hates churn).
 """
 
+import asyncio
 import json
 import math
 import os
@@ -259,7 +260,13 @@ def start_print(printer: str, filename: str, ams_mapping: list[int], confirm: st
     s = prn.snapshot()
     if s["state"] in ("RUNNING", "PREPARE", "PAUSE"):
         return f"REFUSED: {prn.name} is {s['state']} on '{s['job']}'. Cancel or wait first."
-    prn.start_print(filename, ams_mapping)
+    if not s.get("connected") or s["state"] in ("UNKNOWN", "DISCONNECTED"):
+        return (f"REFUSED: {prn.name} is not connected (state {s['state']}). "
+                "Connect the printer first, then retry.")
+    try:
+        prn.start_print(filename, ams_mapping)
+    except Exception as e:
+        return f"REFUSED: {e}"
     time.sleep(8)
     s2 = prn.snapshot()
     return json.dumps({"sent": True, "state_after_8s": s2["state"],
@@ -267,6 +274,20 @@ def start_print(printer: str, filename: str, ams_mapping: list[int], confirm: st
                        "note": "PREPARE/RUNNING = accepted. If state unchanged, the printer "
                                "may not be in LAN mode (P1S requires it) or is settling — "
                                "check printer_status in 30s."}, indent=2)
+
+
+@mcp.tool()
+def connect_printer(printer: str) -> str:
+    """Ask an OctoPrint-driven printer to open its serial connection to the
+    printer (saved port/baud). Bambu printers connect automatically over MQTT
+    and don't need this."""
+    prn = _pick(printer)
+    if not _is_octo(prn):
+        return f"{prn.name}: not applicable — Bambu printers connect automatically."
+    try:
+        return prn.connect_serial()
+    except Exception as e:
+        return f"REFUSED: {e}"
 
 
 @mcp.tool()
@@ -335,12 +356,34 @@ from starlette.responses import HTMLResponse, JSONResponse
 _DASH_PATH = os.path.join(os.path.dirname(__file__), "dashboard.html")
 
 
+async def _run(fn, *a, **kw):
+    """Run a synchronous (blocking) printer call off the event loop, so a slow
+    or stuck printer call (e.g. the 8s settle in start_print) doesn't freeze
+    fleet polling / other requests."""
+    return await asyncio.to_thread(fn, *a, **kw)
+
+
+def _safe_route(fn):
+    """Wrap a custom_route handler so ANY exception inside it becomes a JSON
+    error body with a 500 status — never a bare/non-JSON error page. The
+    dashboard's api() helper always gets JSON back, even on a crash."""
+    async def wrapper(request):
+        try:
+            return await fn(request)
+        except Exception as e:
+            return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=500)
+    wrapper.__name__ = getattr(fn, "__name__", "route")
+    return wrapper
+
+
 @mcp.custom_route("/", methods=["GET"])
+@_safe_route
 async def _root(request: Request):
     return HTMLResponse('<meta http-equiv="refresh" content="0; url=/dashboard">')
 
 
 @mcp.custom_route("/dashboard", methods=["GET"])
+@_safe_route
 async def _dashboard(request: Request):
     with open(_DASH_PATH) as fh:
         return HTMLResponse(fh.read())
@@ -352,35 +395,44 @@ async def _api_ui_version(request: Request):
 
 
 @mcp.custom_route("/api/fleet", methods=["GET"])
+@_safe_route
 async def _api_fleet(request: Request):
-    out = []
-    for prn in PRINTERS.values():
-        s = prn.snapshot()
-        out.append(s)
+    def work():
+        return [prn.snapshot() for prn in PRINTERS.values()]
+    out = await _run(work)
     return JSONResponse(out)
 
 
 @mcp.custom_route("/api/printer/{name}", methods=["GET"])
+@_safe_route
 async def _api_printer(request: Request):
-    prn = _pick(request.path_params["name"])
-    trays = []
-    for t in prn.ams_trays():
-        trays.append({**t, "color_name": color_name(t["color"]) if t["color"] else None})
-    return JSONResponse({"snapshot": prn.snapshot(), "trays": trays,
-                         "palette": sorted(PALETTE.keys())})
+    name = request.path_params["name"]
+
+    def work():
+        prn = _pick(name)
+        trays = []
+        for t in prn.ams_trays():
+            trays.append({**t, "color_name": color_name(t["color"]) if t["color"] else None})
+        return {"snapshot": prn.snapshot(), "trays": trays,
+                "palette": sorted(PALETTE.keys()), "kind": prn.kind}
+    return JSONResponse(await _run(work))
 
 
 @mcp.custom_route("/api/printer/{name}/files", methods=["GET"])
+@_safe_route
 async def _api_files(request: Request):
     refresh = request.query_params.get("refresh") == "1"
-    raw = list_sd_files(request.path_params["name"], refresh_metadata=refresh)
+    name = request.path_params["name"]
+    raw = await _run(list_sd_files, name, refresh_metadata=refresh)
     return JSONResponse(json.loads(raw))
 
 
 @mcp.custom_route("/api/printer/{name}/suggest", methods=["POST"])
+@_safe_route
 async def _api_suggest(request: Request):
     body = await request.json()
-    raw = suggest_mapping(request.path_params["name"], body["filename"])
+    name = request.path_params["name"]
+    raw = await _run(suggest_mapping, name, body["filename"])
     try:
         return JSONResponse(json.loads(raw))
     except Exception:
@@ -388,38 +440,47 @@ async def _api_suggest(request: Request):
 
 
 @mcp.custom_route("/api/printer/{name}/start", methods=["POST"])
+@_safe_route
 async def _api_start(request: Request):
     body = await request.json()
     if not body.get("plate_clear"):
         return JSONResponse({"error": "plate_clear must be confirmed"}, status_code=400)
-    raw = start_print(request.path_params["name"], body["filename"],
-                      body["ams_mapping"], body["confirm"])
+    name = request.path_params["name"]
+    raw = await _run(start_print, name, body["filename"], body["ams_mapping"], body["confirm"])
     if raw.startswith("REFUSED"):
         return JSONResponse({"error": raw}, status_code=409)
     return JSONResponse(json.loads(raw))
 
 
 @mcp.custom_route("/api/printer/{name}/action", methods=["POST"])
+@_safe_route
 async def _api_action(request: Request):
     body = await request.json()
     name = request.path_params["name"]
     act = body.get("action")
     if act == "cancel":
-        return JSONResponse({"result": cancel_print(name)})
-    if act == "pause":
-        return JSONResponse({"result": pause_print(name)})
-    if act == "resume":
-        return JSONResponse({"result": resume_print(name)})
-    if act in ("light_on", "light_off"):
-        return JSONResponse({"result": chamber_light(name, act == "light_on")})
-    return JSONResponse({"error": f"unknown action {act}"}, status_code=400)
+        res = await _run(cancel_print, name)
+    elif act == "pause":
+        res = await _run(pause_print, name)
+    elif act == "resume":
+        res = await _run(resume_print, name)
+    elif act in ("light_on", "light_off"):
+        res = await _run(chamber_light, name, act == "light_on")
+    elif act == "connect":
+        res = await _run(connect_printer, name)
+    else:
+        return JSONResponse({"error": f"unknown action {act}"}, status_code=400)
+    if isinstance(res, str) and res.startswith("REFUSED"):
+        return JSONResponse({"error": res}, status_code=409)
+    return JSONResponse({"result": res})
 
 
 @mcp.custom_route("/api/printer/{name}/tray", methods=["POST"])
+@_safe_route
 async def _api_tray(request: Request):
     body = await request.json()
-    res = set_tray(request.path_params["name"], int(body["tray_id"]),
-                   body["material"], body["color"])
+    name = request.path_params["name"]
+    res = await _run(set_tray, name, int(body["tray_id"]), body["material"], body["color"])
     return JSONResponse({"result": res})
 
 
