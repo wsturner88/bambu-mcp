@@ -31,6 +31,10 @@ prints from anywhere on earth without exposing anything to the internet.
   applies your part-color conventions, flags slicing errors
 - 🖨️ **`start_print`** — from SD card, with `ams_mapping` spool override
 - ⏯️ `pause_print` / `resume_print` / `cancel_print` / `chamber_light`
+- 🔌 `connect_printer` — OctoPrint-driven printers only: open the USB/serial link when the
+  printer shows NOT CONNECTED (Bambus connect on their own)
+- 🖥️ Built-in touch **dashboard** at `/dashboard` (1024×600 kiosk) — same safety gates as the
+  tools; every waiting screen has a Back button and a 20 s timeout, never a dead end
 - 🔄 **`set_tray`** — re-register a tray after a spool swap, by color *name*
 - 🗑️ `delete_sd_file`, `printer_status`, `list_printers`
 
