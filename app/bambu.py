@@ -282,6 +282,7 @@ class BambuPrinter:
 # as BambuPrinter where it makes sense; no AMS, start goes through the job API.
 
 import urllib.error
+import urllib.parse
 import urllib.request
 
 
@@ -423,8 +424,12 @@ class OctoPrintPrinter:
         return out
 
     def start_print(self, filename, ams_mapping=None, origin="local"):
+        # OctoPrint file paths are folder/name and routinely contain spaces; urllib
+        # refuses a URL with any raw space, so percent-encode the path (keeping the
+        # folder separators) before it goes into the request line.
+        path = urllib.parse.quote(filename, safe="/")
         try:
-            self._post(f"/api/files/{origin}/{filename}", {"command": "select", "print": True})
+            self._post(f"/api/files/{origin}/{path}", {"command": "select", "print": True})
         except urllib.error.HTTPError as e:
             raise PrinterError(
                 f"OctoPrint refused the print ({e.code} {e.reason}) — is the printer "
