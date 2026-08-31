@@ -133,7 +133,7 @@ async function api(url, opts={}, timeoutMs=20000){
     r = await fetch(url, {...opts, signal: ctrl.signal});
   }catch(e){
     if(e.name === 'AbortError'){
-      throw new Error('No answer from the server after 20 seconds — is the printer connected?');
+      throw new Error(`No answer from the server after ${Math.round(timeoutMs/1000)} seconds — is the printer connected?`);
     }
     throw new Error(e.message || 'Network error talking to the server.');
   }finally{
@@ -229,7 +229,9 @@ let SEL = null;
 
 async function askPrint(encName){
   const filename = decodeURIComponent(encName);
-  $('mbody').innerHTML = '<h2>Checking spools…</h2><button class="big" style="margin-top:12px;width:100%" onclick="closeModal()">Back</button>';
+  $('mbody').innerHTML = '<h2>Checking spools…</h2>' +
+    '<div class="note">First time this file is used, its details are read off the printer — this can take up to a minute.</div>' +
+    '<button class="big" style="margin-top:12px;width:100%" onclick="closeModal()">Back</button>';
   $('modal').classList.add('on');
   try{
     const pd = await api('/api/printer/'+CUR);
@@ -246,7 +248,7 @@ async function askPrint(encName){
       return;
     }
     const d = await api(`/api/printer/${CUR}/suggest`, {method:'POST',
-      headers:{'Content-Type':'application/json'}, body: JSON.stringify({filename})});
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({filename})}, 90000);
     const notes = (d.notes||[]).map(n=>`<div class="warnbox">${n}</div>`).join('');
     const trays = (pd.trays||[]).filter(t=>t.type);
     const pickable = trays.length > 0 && (d.ams_mapping||[]).length === 1;

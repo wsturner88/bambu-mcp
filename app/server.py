@@ -14,6 +14,7 @@ import json
 import math
 import os
 import re
+import threading
 import time
 
 import yaml
@@ -83,16 +84,42 @@ def _cache_save(c: dict):
     with open(CACHE_PATH, "w") as fh:
         json.dump(c, fh)
 
+# metacache.json is one shared file — serialize its read/mutate/write so two
+# threads (a live /suggest and a background pre-warm) can't clobber each other.
+_cache_lock = threading.Lock()
+
+# Bambu printers tolerate ~one FTPS session at a time. One lock per printer,
+# created lazily, so a pre-warm and a live /suggest never open two sessions
+# to the same printer at once — but different printers can still run in parallel.
+_ftps_locks: dict = {}
+_ftps_locks_guard = threading.Lock()
+
+def _ftps_lock(printer_name: str) -> threading.Lock:
+    with _ftps_locks_guard:
+        lock = _ftps_locks.get(printer_name)
+        if lock is None:
+            lock = _ftps_locks[printer_name] = threading.Lock()
+        return lock
+
 def _meta_for(prn: BambuPrinter, name: str, size: int, download_if_missing: bool):
-    cache = _cache_load()
     key = f"{prn.name}|{name}|{size}"
-    if key in cache:
-        return cache[key]
+    with _cache_lock:
+        cache = _cache_load()
+        if key in cache:
+            return cache[key]
     if not download_if_missing:
         return None
-    meta = parse_3mf_meta(prn.sd_download(name))
-    cache[key] = meta
-    _cache_save(cache)
+    with _ftps_lock(prn.name):
+        # someone else may have downloaded this exact file while we waited for the lock
+        with _cache_lock:
+            cache = _cache_load()
+            if key in cache:
+                return cache[key]
+        meta = parse_3mf_meta(prn.sd_download(name))
+        with _cache_lock:
+            cache = _cache_load()
+            cache[key] = meta
+            _cache_save(cache)
     return meta
 
 def _pick(name: str):
@@ -108,6 +135,52 @@ def _describe_meta(meta: dict) -> dict:
            for f in meta.get("filaments", [])]
     return {"print_time": meta.get("print_time"), "weight_g": meta.get("weight_g"),
             "sliced_for": meta.get("printer_model_id"), "filaments": fil}
+
+# one background pre-warm at a time per printer — repeated dashboard polls
+# (fleet refresh, tapping into a printer) must not stack up duplicate threads
+_prewarm_running: set = set()
+_prewarm_guard = threading.Lock()
+
+def _prewarm(printer_name: str):
+    """Background: quietly download+cache metadata for a printer's uncached SD
+    files, so a later /suggest never has to eat a full FTPS download itself.
+    Never raises — a failure here must not affect any live request."""
+    with _prewarm_guard:
+        if printer_name in _prewarm_running:
+            return
+        _prewarm_running.add(printer_name)
+    try:
+        prn = PRINTERS.get(printer_name.lower())
+        if not prn or _is_octo(prn):
+            return
+        state = prn.snapshot().get("state")
+        if state in ("RUNNING", "PREPARE", "PAUSE", "PAUSED"):
+            return  # don't pull a big file off a printer that's mid-job
+        files = prn.sd_list()
+        with _cache_lock:
+            cache = _cache_load()
+        todo = [f for f in files if f"{prn.name}|{f['name']}|{f['size']}" not in cache]
+        if not todo:
+            return
+        print(f"[prewarm] {prn.name}: warming {len(todo)} file(s)", flush=True)
+        for f in todo:
+            # re-check every file: a print may have started since we began, and
+            # a long FTPS pull during a job is exactly what this guard exists to avoid
+            if prn.snapshot().get("state") in ("RUNNING", "PREPARE", "PAUSE", "PAUSED"):
+                print(f"[prewarm] {prn.name}: job started — stopping early", flush=True)
+                return
+            try:
+                _meta_for(prn, f["name"], f["size"], True)
+                print(f"[prewarm] {prn.name}: cached {f['name']}", flush=True)
+            except Exception as e:
+                print(f"[prewarm] {prn.name}: failed on {f['name']}: {e}", flush=True)
+            time.sleep(1)  # give a waiting user request a chance at the FTPS lock
+        print(f"[prewarm] {prn.name}: done", flush=True)
+    except Exception as e:
+        print(f"[prewarm] {printer_name}: aborted: {e}", flush=True)
+    finally:
+        with _prewarm_guard:
+            _prewarm_running.discard(printer_name)
 
 # ------------------------------------------------------------- MCP tools
 
@@ -424,7 +497,11 @@ async def _api_files(request: Request):
     refresh = request.query_params.get("refresh") == "1"
     name = request.path_params["name"]
     raw = await _run(list_sd_files, name, refresh_metadata=refresh)
-    return JSONResponse(json.loads(raw))
+    out = json.loads(raw)
+    # quietly cache metadata for anything still uncached, so the next tap of
+    # PRINT on this printer doesn't have to eat a full FTPS download itself
+    threading.Thread(target=_prewarm, args=(name,), daemon=True).start()
+    return JSONResponse(out)
 
 
 @mcp.custom_route("/api/printer/{name}/suggest", methods=["POST"])
