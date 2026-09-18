@@ -196,11 +196,12 @@ async function pview(){
     $('p-light-off').style.display = (d.kind==='octoprint') ? 'none' : '';
     window._kind = d.kind;
     window._palette = d.palette;
+    window._materials = d.materials;
     $('p-trays').innerHTML = d.trays.map(t=>`
       <div class="tray"><div style="font-size:13px;color:var(--dim)">Slot ${t.slot_1based}</div>
         <div class="tcol">${t.color_name||'EMPTY'}</div>
         <div class="tmat">${t.type||'&mdash;'}</div>
-        <button style="min-height:44px;font-size:14px;width:100%" onclick="askTray(${t.tray},'${t.type||'PETG'}')">Change</button>
+        <button style="min-height:44px;font-size:14px;width:100%" onclick="askTray(${t.tray},'${t.type||''}')">Change</button>
       </div>`).join('');
   }catch(e){}
 }
@@ -250,17 +251,32 @@ async function askPrint(encName){
     const d = await api(`/api/printer/${CUR}/suggest`, {method:'POST',
       headers:{'Content-Type':'application/json'}, body: JSON.stringify({filename})}, 90000);
     const notes = (d.notes||[]).map(n=>`<div class="warnbox">${n}</div>`).join('');
-    const trays = (pd.trays||[]).filter(t=>t.type);
-    const pickable = trays.length > 0 && (d.ams_mapping||[]).length === 1;
-    SEL = pickable ? d.ams_mapping[0] : null;
     window._file = d.file;
+    if(d.blocked){
+      // multi-filament job with no safe spool for one of the filaments — no start path.
+      $('mbody').innerHTML = `
+        <h2 style="color:#f5b73d;font-size:24px">&#9888; CANNOT START</h2>
+        <div style="font-size:19px;font-weight:800;margin-top:4px">${d.file.replace('.gcode.3mf','')} &mdash; on ${CUR}</div>
+        <div class="warnbox">${d.blocked}</div>
+        ${notes}
+        <div class="row"><button class="big grow" onclick="closeModal()">Back</button></div>`;
+      return;
+    }
+    const trays = (pd.trays||[]).filter(t=>t.type);
+    const mapping = d.ams_mapping||[];
+    // "pickable" = the job uses exactly one AMS slot (single-filament) — offer a
+    // spool grid the human can override. Multi-filament jobs show the full mapping instead.
+    const posEntries = mapping.map((v,i)=>({v,i})).filter(e=>e.v>=0);
+    const pickable = trays.length > 0 && posEntries.length === 1;
+    window._pickIdx = pickable ? posEntries[0].i : null;
+    SEL = pickable ? posEntries[0].v : null;
     const spoolHtml = pickable ? `
       <div class="note" style="font-size:17px;color:var(--txt);margin-top:10px"><b>Tap the spool to print with:</b></div>
       <div class="colorgrid" id="spoolgrid" style="grid-template-columns:repeat(${Math.min(trays.length,4)},1fr)">` +
         trays.map(t=>`<button class="big" id="spool${t.tray}" onclick="pickSpool(${t.tray})"
-          style="min-height:74px;line-height:1.25">Slot ${t.slot_1based}<br>${t.color_name} ${t.type}${d.ams_mapping[0]===t.tray?'<br>&#9733; suggested':''}</button>`).join('') +
+          style="min-height:74px;line-height:1.25">Slot ${t.slot_1based}<br>${t.color_name} ${t.type}${posEntries[0].v===t.tray?'<br>&#9733; suggested':''}</button>`).join('') +
       `</div>`
-      : `<div class="note" style="font-size:17px;color:var(--txt)">Spool: <b>${d.mapping_described}</b></div>`;
+      : `<div class="note" style="font-size:17px;color:var(--txt);white-space:pre-line">Spool:\n<b>${d.mapping_described}</b></div>`;
     $('mbody').innerHTML = `
       <h2 style="color:#f5b73d;font-size:24px">&#9888; ARE YOU SURE YOU WANT TO START A PRINT?</h2>
       <div style="font-size:19px;font-weight:800;margin-top:4px">${d.file.replace('.gcode.3mf','')} &mdash; on ${CUR}</div>
@@ -293,9 +309,10 @@ function highlightSpool(){
 }
 
 function startSelected(suggestedMapping, suggestedConfirm){
-  if(SEL !== null){
-    const mapping = [SEL];
-    const confirm = `${window._file}|${CUR}|${SEL}`;
+  if(SEL !== null && window._pickIdx !== null){
+    const mapping = suggestedMapping.slice();
+    mapping[window._pickIdx] = SEL;
+    const confirm = `${window._file}|${CUR}|${mapping.join(',')}`;
     doStart(window._file, mapping, confirm);
   } else {
     doStart(window._file, suggestedMapping, suggestedConfirm);
@@ -327,13 +344,28 @@ async function doStart(filename, mapping, confirm){
   pview();
 }
 
-function askTray(tray, mat){
+function askTray(tray, curMat){
+  // step 1: material. curMat is '' for an empty tray — no "(current)" marker then.
+  const materials = (window._materials||['PLA','PETG','ABS','ASA','TPU']);
+  $('mbody').innerHTML = `<h2>Slot ${tray+1}: what MATERIAL is loaded?</h2>
+    <div class="colorgrid">` +
+    materials.map(m=>{
+      const isCur = !!curMat && m === curMat;
+      return `<button class="big" style="${isCur?'border:3px solid var(--accent)':''}"
+        onclick="askTrayColor(${tray},'${m}','${curMat}')">${m}${isCur?'<br><span style="font-size:12px">(current)</span>':''}</button>`;
+    }).join('') +
+    `</div><button class="big" style="margin-top:12px;width:100%" onclick="closeModal()">Back</button>`;
+  $('modal').classList.add('on');
+}
+
+function askTrayColor(tray, mat, curMat){
+  // step 2: color, now that material is picked. Back returns to step 1.
   const colors = (window._palette||['GREEN','ORANGE','RED','BLUE','BLACK','WHITE']);
   $('mbody').innerHTML = `<h2>Slot ${tray+1}: what spool is loaded?</h2>
     <div class="note">Material: ${mat} — tap the color NAME on the spool label</div>
     <div class="colorgrid">` +
     colors.map(c=>`<button class="big" onclick="doTray(${tray},'${mat}','${c}')">${c}</button>`).join('') +
-    `</div><button class="big" style="margin-top:12px;width:100%" onclick="closeModal()">Back</button>`;
+    `</div><button class="big" style="margin-top:12px;width:100%" onclick="askTray(${tray},'${curMat}')">Back</button>`;
   $('modal').classList.add('on');
 }
 

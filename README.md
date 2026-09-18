@@ -35,13 +35,22 @@ prints from anywhere on earth without exposing anything to the internet.
   printer shows NOT CONNECTED (Bambus connect on their own)
 - 🖥️ Built-in touch **dashboard** at `/dashboard` (1024×600 kiosk) — same safety gates as the
   tools; every waiting screen has a Back button and a 20 s timeout, never a dead end
-- 🔄 **`set_tray`** — re-register a tray after a spool swap, by color *name*
+- 🔄 **`set_tray`** — re-register a tray after a spool swap, by material AND color
+  *name* (validates against Bambu's generic material profiles — PLA/PETG/ABS/ASA/TPU —
+  and sets the right nozzle temp range; the dashboard's Change flow asks material
+  first, then color)
 - 🗑️ `delete_sd_file`, `printer_status`, `list_printers`
 
 ### Designed-in safety
 - `start_print` **refuses** unless the agent passes the exact confirm string that
   `suggest_mapping` produced — an agent cannot start a job it hasn't accurately
   described to a human first. Busy printers refuse starts outright.
+- **Multi-filament jobs** (e.g. a support-interface filament in a different
+  material) are mapped filament-by-filament, indexed by the slicer's own filament
+  slot — never by list order — and no two filaments are ever assigned the same
+  tray. If a needed material/color has no free spool, `suggest_mapping` **blocks**
+  the job (empty confirm string) rather than guessing; `start_print` independently
+  refuses an empty confirm or an all-unmapped `ams_mapping` for Bambu printers.
 - **Colorblind-safe:** every color leaves the server as a NAME, never a bare hex
   or hue. `set_tray` takes names; the server owns the hex palette.
 - One long-lived MQTT session per printer with gentle reconnects — the P1-series

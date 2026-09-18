@@ -31,6 +31,16 @@ with open(CFG_PATH) as fh:
 PALETTE = {k.upper(): v.upper() for k, v in CFG["palette"].items()}
 RULES = CFG.get("conventions", [])
 
+# Bambu generic material profiles: info_idx, nozzle_temp_min, nozzle_temp_max.
+# Order is the button order the dashboard renders (most-used first).
+MATERIALS = {
+    "PLA":  ("GFL99", 190, 240),
+    "PETG": ("GFG99", 220, 270),
+    "ABS":  ("GFB99", 240, 280),
+    "ASA":  ("GFB98", 240, 280),
+    "TPU":  ("GFU99", 200, 250),
+}
+
 PRINTERS: dict = {}
 for p in CFG["printers"]:
     if p.get("type") == "octoprint":
@@ -254,6 +264,101 @@ def list_sd_files(printer: str, refresh_metadata: bool = False) -> str:
     return json.dumps(out, indent=2)
 
 
+# Pure mapping logic, pulled out of suggest_mapping so it's independently testable
+# (no printer/network calls inside — just filaments + trays + a convention rule).
+def _map_filaments(filaments: list, trays: list, rule) -> tuple:
+    """Assign each USED slicer filament (by its 1-based `id`) to a free AMS tray.
+
+    Match order per filament, never reusing a tray already claimed by another
+    filament in this job: (1) same type + target color, (2) same type any
+    color (with a note), (3) nothing of that type free at all — single-filament
+    jobs fall back to the first tray (today's behavior, the user can tap a
+    different spool on the dashboard); multi-filament jobs are unsafe to guess
+    at, so that filament is left unmapped (-1) and `blocked` is set.
+
+    The part-color convention only steers the PRIMARY filament (largest
+    used_g, or the first filament if none have used_g) — a support/interface
+    filament keeps the file's own color and gets no convention warning.
+
+    Returns (mapping, clauses, notes, blocked):
+      mapping  — 0-based tray ids, list length = max slicer filament id,
+                 indexed by id-1 (`ams_mapping` for project_file), -1 = unused/unmatched
+      clauses  — one human line per used filament, e.g. "filament 1 PETG → slot 2 (GREEN PETG)"
+      notes    — ⚠ warnings to surface to the human
+      blocked  — ⛔ string if the job cannot be safely started as-is, else None
+    """
+    if not filaments:
+        return [], [], [], None
+
+    used_gs = [f.get("used_g") for f in filaments]
+    if any(g is not None for g in used_gs):
+        primary = max(filaments, key=lambda f: f.get("used_g") or 0)
+    else:
+        primary = filaments[0]  # no used_g anywhere (old cache entry, or slicer omitted it)
+
+    max_id = max((f.get("id") or i + 1) for i, f in enumerate(filaments))
+    mapping = [-1] * max_id
+    clauses, notes, blocked_msgs = [], [], []
+    claimed: set = set()
+    multi = len(filaments) > 1
+
+    for i, fl in enumerate(filaments):
+        fid = fl.get("id") or (i + 1)  # shouldn't happen, but fall back to list position
+        slot_idx = fid - 1
+        want_type = fl["type"]
+        want_color = color_name(fl["color"])
+        target_colors = [want_color]
+        if rule and fl is primary:
+            conv = rule["color"].upper().split("|")
+            if want_color not in conv:
+                notes.append(f'⚠ file wants {want_color} but convention says {rule["color"]} '
+                             f'— recommending the CONVENTION color')
+                target_colors = conv
+
+        chosen, note = None, None
+        # (1) same type + target color, unclaimed
+        for tc in target_colors:
+            for t in trays:
+                if t["tray"] not in claimed and t["type"] == want_type and color_name(t["color"]) == tc:
+                    chosen = t
+                    break
+            if chosen:
+                break
+        # (2) same type, any color, unclaimed
+        if not chosen:
+            for t in trays:
+                if t["tray"] not in claimed and t["type"] == want_type:
+                    chosen = t
+                    note = (f'⚠ no {want_type} in {"/".join(target_colors)} loaded — using slot '
+                            f'{t["slot_1based"]} ({color_name(t["color"])} {want_type})')
+                    break
+        # (3) no tray of that type free at all
+        if not chosen:
+            if multi:
+                blocked_msgs.append(
+                    f'⛔ this job needs {want_type} ({"/".join(target_colors)}) but no free '
+                    f'{want_type} spool is registered in the AMS — load it and set the '
+                    f"slot's material with Change")
+            elif trays:
+                chosen = trays[0]
+                note = (f'⚠ no {want_type} in {"/".join(target_colors)} loaded — '
+                        f'falling back to tray {chosen["tray"]} '
+                        f'({color_name(chosen["color"])}); swap spools if that is wrong')
+        if note:
+            notes.append(note)
+
+        if chosen:
+            claimed.add(chosen["tray"])
+            mapping[slot_idx] = chosen["tray"]
+            clauses.append(f'filament {fid} {want_type} → slot {chosen["slot_1based"]} '
+                           f'({color_name(chosen["color"])} {want_type})')
+        else:
+            clauses.append(f'filament {fid} {want_type} → UNASSIGNED')
+
+    blocked = " | ".join(blocked_msgs) if blocked_msgs else None
+    return mapping, clauses, notes, blocked
+
+
 @mcp.tool()
 def suggest_mapping(printer: str, filename: str) -> str:
     """Work out which AMS tray(s) a job should use — applying the user's part-color
@@ -269,6 +374,7 @@ def suggest_mapping(printer: str, filename: str) -> str:
             "print_time": f.get("print_time"), "weight_g": None,
             "ams_mapping": [], "mapping_described": "the loaded filament (no AMS on this printer)",
             "notes": ["This printer prints with whatever filament is physically loaded — check it."],
+            "blocked": None,
             "confirm_string": f"{filename}|{prn.name}|",
             "next_step": ("Ask the human: (1) is the build plate clear? (2) is the right "
                           "filament loaded? Then call start_print with this confirm_string."),
@@ -280,43 +386,22 @@ def suggest_mapping(printer: str, filename: str) -> str:
     trays = [t for t in prn.ams_trays() if t["type"]]
     rule = convention_for(filename)
 
-    mapping, notes = [], []
-    for fl in meta.get("filaments", []):
-        want_type = fl["type"]
-        want_color = color_name(fl["color"])
-        target_colors = [want_color]
-        if rule:
-            conv = rule["color"].upper().split("|")
-            if want_color not in conv:
-                notes.append(f'⚠ file wants {want_color} but convention says {rule["color"]} '
-                             f'— recommending the CONVENTION color')
-                target_colors = conv
-        chosen = None
-        for tc in target_colors:
-            for t in trays:
-                if t["type"] == want_type and color_name(t["color"]) == tc:
-                    chosen = t
-                    break
-            if chosen:
-                break
-        if not chosen and trays:
-            chosen = trays[0]
-            notes.append(f'⚠ no {want_type} in {"/".join(target_colors)} loaded — '
-                         f'falling back to tray {chosen["tray"]} '
-                         f'({color_name(chosen["color"])}); swap spools if that is wrong')
-        mapping.append(chosen["tray"] if chosen else 0)
-
-    tray_desc = ", ".join(f'tray {t} ({color_name(next(x["color"] for x in trays if x["tray"] == t))})'
-                          for t in mapping)
-    confirm = f"{filename}|{prn.name}|{','.join(map(str, mapping))}"
+    mapping, clauses, notes, blocked = _map_filaments(meta.get("filaments", []), trays, rule)
+    mapping_described = "\n".join(clauses)
+    confirm = "" if blocked else f"{filename}|{prn.name}|{','.join(map(str, mapping))}"
+    if blocked:
+        next_step = f"BLOCKED — {blocked} Resolve that first; do not call start_print."
+    else:
+        next_step = ("Ask the human: (1) is the build plate clear? (2) approve "
+                     f"printing with: {'; '.join(clauses)}? Then call start_print with this confirm_string.")
     return json.dumps({
         "file": filename, "printer": prn.name,
         "print_time": meta.get("print_time"), "weight_g": meta.get("weight_g"),
-        "ams_mapping": mapping, "mapping_described": tray_desc,
+        "ams_mapping": mapping, "mapping_described": mapping_described,
         "notes": notes,
+        "blocked": blocked,
         "confirm_string": confirm,
-        "next_step": ("Ask the human: (1) is the build plate clear? (2) approve "
-                      f"printing with {tray_desc}? Then call start_print with this confirm_string."),
+        "next_step": next_step,
     }, indent=2)
 
 
@@ -326,6 +411,13 @@ def start_print(printer: str, filename: str, ams_mapping: list[int], confirm: st
     from suggest_mapping — this proves the job was described to the human first.
     Never call this without explicit human approval and a plate-clear check."""
     prn = _pick(printer)
+    # OctoPrint printers legitimately send an empty mapping + a confirm string
+    # ending in "|" (no AMS to map). A Bambu printer never should — an empty
+    # confirm or an all -1 mapping means suggest_mapping blocked this job.
+    if not _is_octo(prn) and (not confirm or not any(t >= 0 for t in ams_mapping)):
+        return ("REFUSED: empty confirm string or no valid tray in ams_mapping — "
+                "suggest_mapping blocked this job (see its notes). Load the missing "
+                "filament and re-run suggest_mapping.")
     expected = f"{filename}|{prn.name}|{','.join(map(str, ams_mapping))}"
     if confirm != expected:
         return (f"REFUSED: confirm string mismatch.\nExpected: {expected}\nGot:      {confirm}\n"
@@ -396,18 +488,24 @@ def chamber_light(printer: str, on: bool) -> str:
 
 @mcp.tool()
 def set_tray(printer: str, tray_id: int, material: str, color: str) -> str:
-    """Register a tray after a spool swap. `color` is a palette NAME (GREEN,
-    ORANGE, RED, BLUE, BLACK, WHITE...) — the server supplies the exact hex;
+    """Register a tray after a spool swap. `material` is PLA/PETG/ABS/ASA/TPU;
+    `color` is a palette NAME (GREEN, ORANGE, RED, BLUE, BLACK, WHITE...) — the
+    server supplies the exact hex and the material's generic temp profile;
     nobody ever has to pick or verify a hue by eye."""
     if _is_octo(_pick(printer)):
         return f"{printer} has no AMS trays to set."
     name = color.upper()
     if name not in PALETTE:
         return f"Unknown color '{color}'. Palette: {', '.join(PALETTE)}"
+    mat = material.upper()
+    if mat not in MATERIALS:
+        return f"Unknown material '{material}'. Materials: {', '.join(MATERIALS)}"
+    info_idx, temp_min, temp_max = MATERIALS[mat]
     prn = _pick(printer)
-    prn.set_tray(tray_id, material.upper(), PALETTE[name])
+    prn.set_tray(tray_id, mat, PALETTE[name],
+                 temp_min=temp_min, temp_max=temp_max, info_idx=info_idx)
     time.sleep(3)
-    return f"tray {tray_id} set to {name} {material.upper()} — verify:\n" + ams_state(printer)
+    return f"tray {tray_id} set to {name} {mat} — verify:\n" + ams_state(printer)
 
 
 @mcp.tool()
@@ -487,7 +585,8 @@ async def _api_printer(request: Request):
         for t in prn.ams_trays():
             trays.append({**t, "color_name": color_name(t["color"]) if t["color"] else None})
         return {"snapshot": prn.snapshot(), "trays": trays,
-                "palette": sorted(PALETTE.keys()), "kind": prn.kind}
+                "palette": sorted(PALETTE.keys()), "materials": list(MATERIALS),
+                "kind": prn.kind}
     return JSONResponse(await _run(work))
 
 

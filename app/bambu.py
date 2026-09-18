@@ -75,12 +75,24 @@ def parse_3mf_meta(data: bytes) -> dict:
         out["print_time"] = f"{s // 3600}h{(s % 3600) // 60:02d}m"
     m = re.search(r'weight"\s+value="([\d.]+)"', t)
     out["weight_g"] = float(m.group(1)) if m else None
-    out["filaments"] = [
-        {"id": int(a), "type": b, "color": "#" + c.lstrip("#").upper()[:6]}
-        for a, b, c in re.findall(
-            r'<filament\s+id="(\d+)"[^>]*type="([^"]*)"[^>]*color="#?([0-9A-Fa-f]{6})', t
-        )
-    ]
+    # Attribute order on <filament> varies between slicer versions (id/tray_info_idx/
+    # type/color/used_m/used_g in no guaranteed order), so pull each tag's attributes
+    # individually instead of one big ordered regex.
+    filaments = []
+    for tag in re.findall(r"<filament\b[^>]*/?>", t):
+        m_id = re.search(r'\bid="(\d+)"', tag)
+        m_type = re.search(r'\btype="([^"]*)"', tag)
+        m_color = re.search(r'\bcolor="#?([0-9A-Fa-f]{6})', tag)
+        if not (m_id and m_type and m_color):
+            continue
+        m_used_g = re.search(r'\bused_g="([\d.]+)"', tag)
+        filaments.append({
+            "id": int(m_id.group(1)),
+            "type": m_type.group(1),
+            "color": "#" + m_color.group(1).upper()[:6],
+            "used_g": float(m_used_g.group(1)) if m_used_g else None,
+        })
+    out["filaments"] = filaments
     plates = [n for n in z.namelist() if re.match(r"Metadata/plate_\d+\.gcode$", n)]
     out["plates"] = plates
     return out
