@@ -13,6 +13,7 @@ in LAN-only mode; A1 fw 01.08.01.00 in cloud mode) on 2026-08-20:
   - FTPS = implicit TLS on :990, passive mode.
 """
 
+import base64
 import io
 import json
 import os
@@ -109,6 +110,47 @@ def extract_plate_png(data: bytes):
         if cand in names:
             return z.read(cand)
     return None
+
+
+# PrusaSlicer embeds preview images as base64 inside gcode comments, one block
+# per format, e.g.:
+#   ; thumbnail begin 640x480 83500
+#   ; iVBORw0KGgo...
+#   ; thumbnail end
+# `thumbnail begin` (no suffix) is always PNG; `thumbnail_QOI`/`thumbnail_JPG`
+# blocks have the same shape in other formats and are deliberately not matched
+# here (the literal space after "thumbnail" excludes the "_QOI"/"_JPG" ones).
+_GCODE_PNG_RE = re.compile(
+    rb"; thumbnail begin (\d+)x(\d+) \d+\r?\n(.*?); thumbnail end",
+    re.S,
+)
+
+
+def extract_gcode_png(data: bytes):
+    """Pull the largest embedded PNG plate preview out of a slice of a
+    PrusaSlicer gcode file's header. Returns None (not an error) when there's
+    no PNG thumbnail block, or nothing in it decodes to a real PNG — some
+    files carry only QOI/JPG previews, or the header slice got truncated
+    mid-block."""
+    best, best_area = None, -1
+    for m in _GCODE_PNG_RE.finditer(data):
+        area = int(m.group(1)) * int(m.group(2))
+        if area <= best_area:
+            continue
+        body = bytearray()
+        for line in m.group(3).splitlines():
+            if line.startswith(b"; "):
+                body += line[2:]
+            elif line.startswith(b";"):
+                body += line[1:]
+        try:
+            png = base64.b64decode(bytes(body))
+        except Exception:
+            continue
+        if not png.startswith(b"\x89PNG"):
+            continue
+        best, best_area = png, area
+    return best
 
 
 # ---------------------------------------------------------------- printer driver
@@ -340,6 +382,11 @@ class OctoPrintPrinter:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status
 
+    def _get_raw(self, path, headers=None, timeout=15):
+        req = urllib.request.Request(self.url + path,
+                                     headers={"X-Api-Key": self.api_key, **(headers or {})})
+        return urllib.request.urlopen(req, timeout=timeout)
+
     def connect(self):  # parity with BambuPrinter; OctoPrint is polled, not streamed
         pass
 
@@ -453,6 +500,25 @@ class OctoPrintPrinter:
                     })
         walk(data.get("files", []))
         return out
+
+    def download_head(self, filename: str, nbytes: int = 524288) -> bytes:
+        """Fetch just the first `nbytes` of a gcode file's header — enough to
+        reach past PrusaSlicer's embedded thumbnail block without pulling the
+        whole (often 100+ MB) file. Served at GET /downloads/files/{origin}/{path},
+        same auth and path-encoding as everywhere else. Most OctoPrint/nginx
+        setups honour the Range header and reply 206 with just that slice, but
+        some proxies ignore it and hand back the whole body 200-style — read()
+        with a byte cap handles both without ever pulling more than nbytes+1
+        bytes off the socket."""
+        path = "/downloads/files/local/" + urllib.parse.quote(filename, safe="/")
+        try:
+            with self._get_raw(path, headers={"Range": f"bytes=0-{nbytes - 1}"}) as r:
+                data = r.read(nbytes + 1)
+        except urllib.error.HTTPError as e:
+            raise PrinterError(f"OctoPrint refused the file download ({e.code} {e.reason}).") from e
+        except (urllib.error.URLError, socket.timeout) as e:
+            raise PrinterError(f"Could not reach OctoPrint at {self.url}: {e}") from e
+        return data[:nbytes]
 
     def start_print(self, filename, ams_mapping=None, origin="local"):
         # OctoPrint file paths are folder/name and routinely contain spaces; urllib

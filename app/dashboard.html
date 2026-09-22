@@ -221,8 +221,9 @@ async function loadFiles(refresh){
       : 'wants ' + ((f.filaments||[]).map(x=>x.color_name+' '+x.type).join(' + ') || 'details not loaded');
     const warn = f.convention_warning ? `<span class="chip warn" style="font-size:12px">FIX AT START</span>` :
                  (f.filaments ? `<span class="chip run" style="font-size:12px">READY</span>` : '');
-    // MK4 (OctoPrint) has no plate-preview pipeline yet — always the placeholder there.
-    const thumb = (!isOcto && f.thumb)
+    // Bambu thumbs are square (plate PNG); MK4/OctoPrint thumbs are 4:3 (640x480
+    // PrusaSlicer preview) — object-fit:contain on .fthumb handles both the same way.
+    const thumb = f.thumb
       ? `<img class="fthumb" src="/api/thumb/${f.thumb}" alt="plate preview">`
       : `<div class="fthumb ph"></div>`;
     return `<div class="frow">

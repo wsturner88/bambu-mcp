@@ -21,7 +21,8 @@ import time
 import yaml
 from mcp.server.fastmcp import FastMCP
 
-from bambu import BambuPrinter, OctoPrintPrinter, extract_plate_png, parse_3mf_meta
+from bambu import (BambuPrinter, OctoPrintPrinter, extract_gcode_png,
+                   extract_plate_png, parse_3mf_meta)
 
 CFG_PATH = os.environ.get("BAMBU_MCP_CONFIG", os.path.join(os.path.dirname(__file__), "config.yml"))
 CACHE_PATH = os.environ.get("BAMBU_MCP_CACHE", "/data/metacache.json")
@@ -115,6 +116,19 @@ def _ftps_lock(printer_name: str) -> threading.Lock:
             lock = _ftps_locks[printer_name] = threading.Lock()
         return lock
 
+# OctoPrint is plain HTTP, not the one-session-at-a-time FTPS above — this
+# lock just keeps two prewarm passes on the same printer from opening
+# redundant header downloads; different printers still run in parallel.
+_octo_locks: dict = {}
+_octo_locks_guard = threading.Lock()
+
+def _octo_lock(printer_name: str) -> threading.Lock:
+    with _octo_locks_guard:
+        lock = _octo_locks.get(printer_name)
+        if lock is None:
+            lock = _octo_locks[printer_name] = threading.Lock()
+        return lock
+
 def _thumb_path(basename: str) -> str:
     return os.path.join(THUMBS_DIR, basename)
 
@@ -157,6 +171,37 @@ def _meta_for(prn: BambuPrinter, name: str, size: int, download_if_missing: bool
             _cache_save(cache)
     return meta
 
+def _octo_thumb_for(prn: OctoPrintPrinter, name: str, size: int):
+    """Read-only cache lookup for an OctoPrint file's plate thumbnail. Never
+    downloads — a live file listing must not block on the printer's network;
+    the actual header pull only happens in _prewarm."""
+    key = f"{prn.name}|{name}|{size}"
+    with _cache_lock:
+        cache = _cache_load()
+    entry = cache.get(key)
+    return entry.get("thumb") if entry else None
+
+def _octo_meta_for(prn: OctoPrintPrinter, name: str, size: int):
+    """Download just the gcode header and cache its PrusaSlicer-embedded plate
+    thumbnail, if it has one. Unlike Bambu's _meta_for there's no slice_info
+    to parse here — OctoPrint's own file API already supplies print time/
+    filament — so the cache entry holds only {"thumb": ...}. Only called from
+    _prewarm, off the request path."""
+    key = f"{prn.name}|{name}|{size}"
+    with _octo_lock(prn.name):
+        # someone else may have finished this exact file while we waited for the lock
+        with _cache_lock:
+            cache = _cache_load()
+            if "thumb" in cache.get(key, {}):
+                return cache[key]
+        data = prn.download_head(name)
+        thumb = _save_thumb(key, extract_gcode_png(data))
+        with _cache_lock:
+            cache = _cache_load()
+            cache[key] = {"thumb": thumb}
+            _cache_save(cache)
+    return {"thumb": thumb}
+
 def _cache_purge(printer_name: str, filename: str):
     """Drop every cached metadata entry for a printer+filename (any cached
     size) and its thumb PNG, if any — called after a successful SD delete so
@@ -195,51 +240,87 @@ def _describe_meta(meta: dict) -> dict:
 _prewarm_running: set = set()
 _prewarm_guard = threading.Lock()
 
+def _prewarm_bambu(prn: BambuPrinter):
+    state = prn.snapshot().get("state")
+    if state in ("RUNNING", "PREPARE", "PAUSE", "PAUSED"):
+        return  # don't pull a big file off a printer that's mid-job
+    files = prn.sd_list()
+    with _cache_lock:
+        cache = _cache_load()
+    # (file, force) — force=True means "already cached, but from before
+    # thumbnails existed: re-download once to backfill the thumb". An
+    # entry with "thumb": null was already tried and had no plate image,
+    # so it's left alone rather than retried forever.
+    todo = []
+    for f in files:
+        entry = cache.get(f"{prn.name}|{f['name']}|{f['size']}")
+        if entry is None:
+            todo.append((f, False))
+        elif "thumb" not in entry:
+            todo.append((f, True))
+    if not todo:
+        return
+    print(f"[prewarm] {prn.name}: warming {len(todo)} file(s)", flush=True)
+    for f, force in todo:
+        # re-check every file: a print may have started since we began, and
+        # a long FTPS pull during a job is exactly what this guard exists to avoid
+        if prn.snapshot().get("state") in ("RUNNING", "PREPARE", "PAUSE", "PAUSED"):
+            print(f"[prewarm] {prn.name}: job started — stopping early", flush=True)
+            return
+        try:
+            _meta_for(prn, f["name"], f["size"], True, force=force)
+            print(f"[prewarm] {prn.name}: cached {f['name']}", flush=True)
+        except Exception as e:
+            print(f"[prewarm] {prn.name}: failed on {f['name']}: {e}", flush=True)
+        time.sleep(1)  # give a waiting user request a chance at the FTPS lock
+    print(f"[prewarm] {prn.name}: done", flush=True)
+
+
+def _prewarm_octo(prn: OctoPrintPrinter):
+    state = prn.snapshot().get("state")
+    if state in ("RUNNING", "PREPARE", "PAUSE", "PAUSED"):
+        return  # don't pull a gcode header off a printer that's mid-job
+    files = prn.files()
+    with _cache_lock:
+        cache = _cache_load()
+    # unlike Bambu there's no "backfill an old entry" case — the cache entry
+    # for an OctoPrint file only ever holds "thumb", so missing the key
+    # entirely and missing "thumb" on it are the same condition
+    todo = [f for f in files if "thumb" not in cache.get(f"{prn.name}|{f['name']}|{f['size']}", {})]
+    if not todo:
+        return
+    print(f"[prewarm] {prn.name}: warming {len(todo)} file(s)", flush=True)
+    for f in todo:
+        if prn.snapshot().get("state") in ("RUNNING", "PREPARE", "PAUSE", "PAUSED"):
+            print(f"[prewarm] {prn.name}: job started — stopping early", flush=True)
+            return
+        try:
+            _octo_meta_for(prn, f["name"], f["size"])
+            print(f"[prewarm] {prn.name}: cached {f['name']}", flush=True)
+        except Exception as e:
+            print(f"[prewarm] {prn.name}: failed on {f['name']}: {e}", flush=True)
+        time.sleep(1)  # give a waiting user request a chance at the header download
+    print(f"[prewarm] {prn.name}: done", flush=True)
+
+
 def _prewarm(printer_name: str):
-    """Background: quietly download+cache metadata for a printer's uncached SD
-    files, so a later /suggest never has to eat a full FTPS download itself.
-    Never raises — a failure here must not affect any live request."""
+    """Background: quietly download+cache metadata for a printer's uncached
+    files (SD-card .3mf metadata for Bambu, gcode-header plate thumbnails for
+    OctoPrint), so a later /suggest or file listing never has to eat a slow
+    download itself. Never raises — a failure here must not affect any live
+    request."""
     with _prewarm_guard:
         if printer_name in _prewarm_running:
             return
         _prewarm_running.add(printer_name)
     try:
         prn = PRINTERS.get(printer_name.lower())
-        if not prn or _is_octo(prn):
+        if not prn:
             return
-        state = prn.snapshot().get("state")
-        if state in ("RUNNING", "PREPARE", "PAUSE", "PAUSED"):
-            return  # don't pull a big file off a printer that's mid-job
-        files = prn.sd_list()
-        with _cache_lock:
-            cache = _cache_load()
-        # (file, force) — force=True means "already cached, but from before
-        # thumbnails existed: re-download once to backfill the thumb". An
-        # entry with "thumb": null was already tried and had no plate image,
-        # so it's left alone rather than retried forever.
-        todo = []
-        for f in files:
-            entry = cache.get(f"{prn.name}|{f['name']}|{f['size']}")
-            if entry is None:
-                todo.append((f, False))
-            elif "thumb" not in entry:
-                todo.append((f, True))
-        if not todo:
-            return
-        print(f"[prewarm] {prn.name}: warming {len(todo)} file(s)", flush=True)
-        for f, force in todo:
-            # re-check every file: a print may have started since we began, and
-            # a long FTPS pull during a job is exactly what this guard exists to avoid
-            if prn.snapshot().get("state") in ("RUNNING", "PREPARE", "PAUSE", "PAUSED"):
-                print(f"[prewarm] {prn.name}: job started — stopping early", flush=True)
-                return
-            try:
-                _meta_for(prn, f["name"], f["size"], True, force=force)
-                print(f"[prewarm] {prn.name}: cached {f['name']}", flush=True)
-            except Exception as e:
-                print(f"[prewarm] {prn.name}: failed on {f['name']}: {e}", flush=True)
-            time.sleep(1)  # give a waiting user request a chance at the FTPS lock
-        print(f"[prewarm] {prn.name}: done", flush=True)
+        if _is_octo(prn):
+            _prewarm_octo(prn)
+        else:
+            _prewarm_bambu(prn)
     except Exception as e:
         print(f"[prewarm] {printer_name}: aborted: {e}", flush=True)
     finally:
@@ -299,7 +380,10 @@ def list_sd_files(printer: str, refresh_metadata: bool = False) -> str:
     weight and filament colors (slow — ~30s per file on the P1S)."""
     prn = _pick(printer)
     if _is_octo(prn):
-        return json.dumps(prn.files(), indent=2)
+        files = prn.files()
+        for f in files:
+            f["thumb"] = _octo_thumb_for(prn, f["name"], f["size"])
+        return json.dumps(files, indent=2)
     files = prn.sd_list()
     out = []
     for f in files:
@@ -578,8 +662,7 @@ def delete_sd_file(printer: str, filename: str, confirm: str) -> str:
     if filename not in {f["name"] for f in files}:
         return f"REFUSED: '{filename}' is not on {prn.name}'s current file list."
     prn.sd_delete(filename)
-    if not _is_octo(prn):
-        _cache_purge(prn.name, filename)
+    _cache_purge(prn.name, filename)
     return f"deleted {filename}"
 
 
