@@ -47,6 +47,10 @@
           border:1px solid var(--line); border-radius:12px; padding:10px 14px; margin-bottom:8px; }
   .frow .fname { font-size:17px; font-weight:600; }
   .frow .fmeta { font-size:14px; color:var(--dim); }
+  .fthumb { width:64px; height:64px; min-width:64px; border-radius:8px; background:#0d0f12;
+            object-fit:contain; flex-shrink:0; }
+  .fthumb.ph { border:1px dashed var(--line); }
+  .fdelete { margin-left:2px; }
   .trays { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin-top:10px; }
   .tray { background:var(--card); border:1px solid var(--line); border-radius:12px;
           padding:10px; text-align:center; }
@@ -217,11 +221,17 @@ async function loadFiles(refresh){
       : 'wants ' + ((f.filaments||[]).map(x=>x.color_name+' '+x.type).join(' + ') || 'details not loaded');
     const warn = f.convention_warning ? `<span class="chip warn" style="font-size:12px">FIX AT START</span>` :
                  (f.filaments ? `<span class="chip run" style="font-size:12px">READY</span>` : '');
+    // MK4 (OctoPrint) has no plate-preview pipeline yet — always the placeholder there.
+    const thumb = (!isOcto && f.thumb)
+      ? `<img class="fthumb" src="/api/thumb/${f.thumb}" alt="plate preview">`
+      : `<div class="fthumb ph"></div>`;
     return `<div class="frow">
+      ${thumb}
       <div class="grow"><div class="fname">${f.name.replace('.gcode.3mf','').replace(/\.b?gcode$/,'')}</div>
         <div class="fmeta">${f.print_time||'?'} · ${f.weight_g?Math.round(f.weight_g)+' g · ':''}${fil}</div></div>
       ${warn}
       <button class="primary" onclick="askPrint('${encodeURIComponent(f.name)}')">Print</button>
+      <button class="fdelete" onclick="askDelete('${encodeURIComponent(f.name)}')">Delete</button>
     </div>`;
   }).join('');
 }
@@ -401,6 +411,39 @@ async function doCancel(){
     errorCard('Could not cancel', e.message);
   }
   pview();
+}
+
+function askDelete(encName){
+  const filename = decodeURIComponent(encName);
+  const shortName = filename.replace('.gcode.3mf','').replace(/\.b?gcode$/,'');
+  $('mbody').innerHTML = `
+    <h2>Delete this file?</h2>
+    <div style="font-size:22px;font-weight:800;margin-top:8px">${shortName}</div>
+    <div class="note">on ${CUR}</div>
+    <div class="warnbox">This removes it from the printer's SD card. It cannot be undone.</div>
+    <div class="row" style="margin-top:14px">
+      <button class="big" style="flex:1.4" onclick="closeModal()">Back</button>
+      <button class="big danger grow" onclick="doDelete('${encName}')">Yes, delete</button>
+    </div>`;
+  $('modal').classList.add('on');
+}
+
+async function doDelete(encName){
+  const filename = decodeURIComponent(encName);
+  $('mbody').innerHTML = `<h2>Deleting…</h2>
+    <button class="big" style="width:100%;margin-top:12px" onclick="closeModal()">Close</button>`;
+  try{
+    await api(`/api/printer/${CUR}/delete`, {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({filename, confirm: filename})});
+    closeModal();
+    loadFiles(false);
+  }catch(e){
+    $('mbody').innerHTML = `<h2>Could not delete</h2>
+      <div class="warnbox">${e.message}</div>
+      <div class="row" style="margin-top:14px"><button class="big grow" onclick="closeModal()">Back</button></div>`;
+    $('modal').classList.add('on');
+  }
 }
 
 async function doConnect(){

@@ -98,6 +98,19 @@ def parse_3mf_meta(data: bytes) -> dict:
     return out
 
 
+def extract_plate_png(data: bytes):
+    """Pull plate 1's preview image out of a downloaded .gcode.3mf, if the
+    slicer embedded one. Prefers the full-size render; falls back to the
+    thumbnail. Returns None (not an error) when neither is present — some
+    older/odd exports omit both."""
+    z = zipfile.ZipFile(io.BytesIO(data))
+    names = set(z.namelist())
+    for cand in ("Metadata/plate_1.png", "Metadata/plate_1_small.png"):
+        if cand in names:
+            return z.read(cand)
+    return None
+
+
 # ---------------------------------------------------------------- printer driver
 
 class BambuPrinter:
@@ -321,6 +334,12 @@ class OctoPrintPrinter:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status
 
+    def _delete(self, path, timeout=8):
+        req = urllib.request.Request(self.url + path, method="DELETE",
+                                     headers={"X-Api-Key": self.api_key})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status
+
     def connect(self):  # parity with BambuPrinter; OctoPrint is polled, not streamed
         pass
 
@@ -461,3 +480,14 @@ class OctoPrintPrinter:
     def stop(self):   self._job_command({"command": "cancel"}, "cancel")
     def pause(self):  self._job_command({"command": "pause", "action": "pause"}, "pause")
     def resume(self): self._job_command({"command": "pause", "action": "resume"}, "resume")
+
+    def sd_delete(self, filename, origin="local"):
+        # Same space/URL problem as start_print: percent-encode the path before
+        # it goes into the request line, or http.client raises InvalidURL.
+        path = urllib.parse.quote(filename, safe="/")
+        try:
+            self._delete(f"/api/files/{origin}/{path}")
+        except urllib.error.HTTPError as e:
+            raise PrinterError(f"OctoPrint refused the delete ({e.code} {e.reason}).") from e
+        except (urllib.error.URLError, socket.timeout) as e:
+            raise PrinterError(f"Could not reach OctoPrint at {self.url}: {e}") from e

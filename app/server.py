@@ -10,6 +10,7 @@ Design rules (non-negotiable):
 """
 
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -20,10 +21,13 @@ import time
 import yaml
 from mcp.server.fastmcp import FastMCP
 
-from bambu import BambuPrinter, OctoPrintPrinter, parse_3mf_meta
+from bambu import BambuPrinter, OctoPrintPrinter, extract_plate_png, parse_3mf_meta
 
 CFG_PATH = os.environ.get("BAMBU_MCP_CONFIG", os.path.join(os.path.dirname(__file__), "config.yml"))
 CACHE_PATH = os.environ.get("BAMBU_MCP_CACHE", "/data/metacache.json")
+# Plate-preview PNGs live beside the cache, one file per cache key (named by
+# the key's sha1 so a filename with slashes/odd chars never touches a path).
+THUMBS_DIR = os.path.join(os.path.dirname(CACHE_PATH), "thumbs")
 
 with open(CFG_PATH) as fh:
     CFG = yaml.safe_load(fh)
@@ -111,26 +115,66 @@ def _ftps_lock(printer_name: str) -> threading.Lock:
             lock = _ftps_locks[printer_name] = threading.Lock()
         return lock
 
-def _meta_for(prn: BambuPrinter, name: str, size: int, download_if_missing: bool):
-    key = f"{prn.name}|{name}|{size}"
-    with _cache_lock:
-        cache = _cache_load()
-        if key in cache:
-            return cache[key]
-    if not download_if_missing:
+def _thumb_path(basename: str) -> str:
+    return os.path.join(THUMBS_DIR, basename)
+
+def _save_thumb(key: str, png_bytes):
+    """Save a plate-preview PNG for a cache key under THUMBS_DIR. Returns the
+    basename to record in the cache entry, or None if the file had no plate
+    image — recorded as None (not just absent) so _prewarm never retries it."""
+    if not png_bytes:
         return None
-    with _ftps_lock(prn.name):
-        # someone else may have downloaded this exact file while we waited for the lock
+    basename = hashlib.sha1(key.encode()).hexdigest() + ".png"
+    os.makedirs(THUMBS_DIR, exist_ok=True)
+    with open(_thumb_path(basename), "wb") as fh:
+        fh.write(png_bytes)
+    return basename
+
+def _meta_for(prn: BambuPrinter, name: str, size: int, download_if_missing: bool, force: bool = False):
+    """force=True re-downloads even if a cache entry already exists — used to
+    backfill a thumbnail onto an entry cached before thumbnails existed."""
+    key = f"{prn.name}|{name}|{size}"
+    if not force:
         with _cache_lock:
             cache = _cache_load()
             if key in cache:
                 return cache[key]
-        meta = parse_3mf_meta(prn.sd_download(name))
+    if not download_if_missing:
+        return None
+    with _ftps_lock(prn.name):
+        # someone else may have downloaded this exact file while we waited for the lock
+        if not force:
+            with _cache_lock:
+                cache = _cache_load()
+                if key in cache:
+                    return cache[key]
+        data = prn.sd_download(name)
+        meta = parse_3mf_meta(data)
+        meta["thumb"] = _save_thumb(key, extract_plate_png(data))
         with _cache_lock:
             cache = _cache_load()
             cache[key] = meta
             _cache_save(cache)
     return meta
+
+def _cache_purge(printer_name: str, filename: str):
+    """Drop every cached metadata entry for a printer+filename (any cached
+    size) and its thumb PNG, if any — called after a successful SD delete so
+    a stale entry doesn't outlive the file it describes."""
+    prefix = f"{printer_name}|{filename}|"
+    with _cache_lock:
+        cache = _cache_load()
+        keys = [k for k in cache if k.startswith(prefix)]
+        if not keys:
+            return
+        for k in keys:
+            thumb = cache.pop(k, {}).get("thumb")
+            if thumb:
+                try:
+                    os.remove(_thumb_path(thumb))
+                except OSError:
+                    pass
+        _cache_save(cache)
 
 def _pick(name: str):
     prn = PRINTERS.get(name.lower())
@@ -169,18 +213,28 @@ def _prewarm(printer_name: str):
         files = prn.sd_list()
         with _cache_lock:
             cache = _cache_load()
-        todo = [f for f in files if f"{prn.name}|{f['name']}|{f['size']}" not in cache]
+        # (file, force) — force=True means "already cached, but from before
+        # thumbnails existed: re-download once to backfill the thumb". An
+        # entry with "thumb": null was already tried and had no plate image,
+        # so it's left alone rather than retried forever.
+        todo = []
+        for f in files:
+            entry = cache.get(f"{prn.name}|{f['name']}|{f['size']}")
+            if entry is None:
+                todo.append((f, False))
+            elif "thumb" not in entry:
+                todo.append((f, True))
         if not todo:
             return
         print(f"[prewarm] {prn.name}: warming {len(todo)} file(s)", flush=True)
-        for f in todo:
+        for f, force in todo:
             # re-check every file: a print may have started since we began, and
             # a long FTPS pull during a job is exactly what this guard exists to avoid
             if prn.snapshot().get("state") in ("RUNNING", "PREPARE", "PAUSE", "PAUSED"):
                 print(f"[prewarm] {prn.name}: job started — stopping early", flush=True)
                 return
             try:
-                _meta_for(prn, f["name"], f["size"], True)
+                _meta_for(prn, f["name"], f["size"], True, force=force)
                 print(f"[prewarm] {prn.name}: cached {f['name']}", flush=True)
             except Exception as e:
                 print(f"[prewarm] {prn.name}: failed on {f['name']}: {e}", flush=True)
@@ -251,7 +305,8 @@ def list_sd_files(printer: str, refresh_metadata: bool = False) -> str:
     for f in files:
         meta = _meta_for(prn, f["name"], f["size"], refresh_metadata)
         entry = {"name": f["name"], "size_mb": round(f["size"] / 1048576, 2),
-                 "modified": f["modified"], **_describe_meta(meta)}
+                 "modified": f["modified"], "thumb": meta.get("thumb") if meta else None,
+                 **_describe_meta(meta)}
         rule = convention_for(f["name"])
         if rule and meta:
             wanted = {color_name(fl["color"]) for fl in meta.get("filaments", [])}
@@ -510,10 +565,21 @@ def set_tray(printer: str, tray_id: int, material: str, color: str) -> str:
 
 @mcp.tool()
 def delete_sd_file(printer: str, filename: str, confirm: str) -> str:
-    """Delete a file from the SD card. confirm must equal the filename."""
+    """Delete a file from the SD card. confirm must equal the filename.
+    Refuses while a job is active, and if filename isn't on the printer's
+    current file list (guards against typos deleting the wrong/no file)."""
     if confirm != filename:
         return "REFUSED: confirm must equal filename exactly."
-    _pick(printer).sd_delete(filename)
+    prn = _pick(printer)
+    s = prn.snapshot()
+    if s["state"] in ("RUNNING", "PREPARE", "PAUSE"):
+        return f"REFUSED: {prn.name} is printing — delete is not allowed while a job is active"
+    files = prn.files() if _is_octo(prn) else prn.sd_list()
+    if filename not in {f["name"] for f in files}:
+        return f"REFUSED: '{filename}' is not on {prn.name}'s current file list."
+    prn.sd_delete(filename)
+    if not _is_octo(prn):
+        _cache_purge(prn.name, filename)
     return f"deleted {filename}"
 
 
@@ -522,9 +588,12 @@ def delete_sd_file(printer: str, filename: str, confirm: str) -> str:
 # All write paths reuse the exact gates the MCP tools enforce.
 
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse, Response
 
 _DASH_PATH = os.path.join(os.path.dirname(__file__), "dashboard.html")
+# thumb basenames are always sha1-of-cache-key + ".png" (see _save_thumb) —
+# enforce that shape so the path param can never walk out of THUMBS_DIR.
+_THUMB_NAME_RE = re.compile(r"^[0-9a-f]{40}\.png$")
 
 
 async def _run(fn, *a, **kw):
@@ -563,6 +632,26 @@ async def _dashboard(request: Request):
 @mcp.custom_route("/api/ui-version", methods=["GET"])
 async def _api_ui_version(request: Request):
     return JSONResponse({"v": str(os.path.getmtime(_DASH_PATH))})
+
+
+@mcp.custom_route("/api/thumb/{basename}", methods=["GET"])
+@_safe_route
+async def _api_thumb(request: Request):
+    basename = request.path_params["basename"]
+    if not _THUMB_NAME_RE.match(basename):
+        return JSONResponse({"error": "invalid thumbnail name"}, status_code=404)
+    path = _thumb_path(basename)
+
+    def work():
+        try:
+            with open(path, "rb") as fh:
+                return fh.read()
+        except OSError:
+            return None
+    data = await _run(work)
+    if data is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return Response(data, media_type="image/png", headers={"Cache-Control": "max-age=86400"})
 
 
 @mcp.custom_route("/api/fleet", methods=["GET"])
@@ -658,6 +747,17 @@ async def _api_tray(request: Request):
     name = request.path_params["name"]
     res = await _run(set_tray, name, int(body["tray_id"]), body["material"], body["color"])
     return JSONResponse({"result": res})
+
+
+@mcp.custom_route("/api/printer/{name}/delete", methods=["POST"])
+@_safe_route
+async def _api_delete(request: Request):
+    body = await request.json()
+    name = request.path_params["name"]
+    raw = await _run(delete_sd_file, name, body["filename"], body["confirm"])
+    if raw.startswith("REFUSED"):
+        return JSONResponse({"error": raw}, status_code=409)
+    return JSONResponse({"result": raw})
 
 
 if __name__ == "__main__":

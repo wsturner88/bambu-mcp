@@ -35,6 +35,13 @@ prints from anywhere on earth without exposing anything to the internet.
   printer shows NOT CONNECTED (Bambus connect on their own)
 - 🖥️ Built-in touch **dashboard** at `/dashboard` (1024×600 kiosk) — same safety gates as the
   tools; every waiting screen has a Back button and a 20 s timeout, never a dead end
+- 🖼️ **Plate thumbnails** — the dashboard file list shows each job's sliced plate preview
+  (Bambu printers only), pulled from the same `.3mf` download that already reads print time/
+  weight/filaments, and cached alongside it (older cache entries backfill their thumbnail the
+  next time the printer sits idle)
+- 🗑️ **Delete from the dashboard** — two-tap confirm (file name + printer spelled out, no
+  color-only cues); refuses while a job is active or if the file isn't on the printer's current
+  list
 - 🔄 **`set_tray`** — re-register a tray after a spool swap, by material AND color
   *name* (validates against Bambu's generic material profiles — PLA/PETG/ABS/ASA/TPU —
   and sets the right nozzle temp range; the dashboard's Change flow asks material
