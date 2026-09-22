@@ -292,9 +292,6 @@ def _prewarm_octo(prn: OctoPrintPrinter):
         return
     print(f"[prewarm] {prn.name}: warming {len(todo)} file(s)", flush=True)
     for f in todo:
-        if prn.snapshot().get("state") in ("RUNNING", "PREPARE", "PAUSE", "PAUSED"):
-            print(f"[prewarm] {prn.name}: job started — stopping early", flush=True)
-            return
         try:
             _octo_meta_for(prn, f["name"], f["size"])
             print(f"[prewarm] {prn.name}: cached {f['name']}", flush=True)
