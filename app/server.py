@@ -277,9 +277,10 @@ def _prewarm_bambu(prn: BambuPrinter):
 
 
 def _prewarm_octo(prn: OctoPrintPrinter):
-    state = prn.snapshot().get("state")
-    if state in ("RUNNING", "PREPARE", "PAUSE", "PAUSED"):
-        return  # don't pull a gcode header off a printer that's mid-job
+    # No idle gate here, unlike the Bambu pass: this reads 512 KB of a file off
+    # the OctoPrint Pi's disk over HTTP — the printer itself never sees it, so
+    # it's safe mid-job (and MK4 jobs run 9h+; waiting would leave rows blank
+    # for most of a day).
     files = prn.files()
     with _cache_lock:
         cache = _cache_load()
