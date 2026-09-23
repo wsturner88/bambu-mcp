@@ -40,6 +40,7 @@
   .bar { height:14px; background:#0d0f12; border-radius:7px; overflow:hidden; }
   .bar i { display:block; height:100%; background:var(--accent); }
   .pcard .meta { font-size:15px; color:var(--dim); }
+  .pcard .eta { font-size:22px; font-weight:700; min-height:28px; }
 
   /* printer view */
   #files { flex:1; overflow-y:auto; margin-top:10px; }
@@ -161,6 +162,16 @@ function errorCard(title, msg){
   $('modal').classList.add('on');
 }
 
+// When a job should finish: "~3:45 PM", "tomorrow ~7:10 AM", or "Sat ~9:20 AM".
+function finishAt(min){
+  const t = new Date(Date.now() + min*60000), now = new Date();
+  const hm = t.toLocaleTimeString([], {hour:'numeric',minute:'2-digit'});
+  const days = Math.round((new Date(t).setHours(0,0,0,0) - new Date(now).setHours(0,0,0,0)) / 86400000);
+  if(days <= 0) return '~' + hm;
+  if(days === 1) return 'tomorrow ~' + hm;
+  return t.toLocaleDateString([], {weekday:'short'}) + ' ~' + hm;
+}
+
 async function fleet(){
   try{
     const r = await fetch('/api/fleet'); const data = await r.json();
@@ -174,6 +185,7 @@ async function fleet(){
           <span class="chip ${cls}">${word}</span></div>
         <div class="job">${p.job ? p.job : 'No job'}</div>
         <div class="bar"><i style="width:${pct||0}%"></i></div>
+        <div class="eta">${(p.state==='RUNNING' && p.remaining_min) ? 'Done '+finishAt(p.remaining_min) : ''}</div>
         <div class="meta">${p.state==='RUNNING' ? (p.percent+'% · '+left) : ''}</div>
         <div class="meta">Nozzle ${Math.round(p.nozzle_c||0)}&deg; · Bed ${Math.round(p.bed_c||0)}&deg;</div>
       </div>`;
