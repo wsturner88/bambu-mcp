@@ -501,7 +501,7 @@ class OctoPrintPrinter:
         walk(data.get("files", []))
         return out
 
-    def download_head(self, filename: str, nbytes: int = 524288) -> bytes:
+    def download_head(self, filename: str, nbytes: int = 1048576) -> bytes:
         """Fetch just the first `nbytes` of a gcode file's header — enough to
         reach past PrusaSlicer's embedded thumbnail block without pulling the
         whole (often 100+ MB) file. Served at GET /downloads/files/{origin}/{path},

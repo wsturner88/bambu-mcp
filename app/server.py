@@ -277,7 +277,7 @@ def _prewarm_bambu(prn: BambuPrinter):
 
 
 def _prewarm_octo(prn: OctoPrintPrinter):
-    # No idle gate here, unlike the Bambu pass: this reads 512 KB of a file off
+    # No idle gate here, unlike the Bambu pass: this reads 1 MB of a file off
     # the OctoPrint Pi's disk over HTTP — the printer itself never sees it, so
     # it's safe mid-job (and MK4 jobs run 9h+; waiting would leave rows blank
     # for most of a day).
