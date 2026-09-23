@@ -623,26 +623,98 @@ def chamber_light(printer: str, on: bool) -> str:
     return f"light {'on' if on else 'off'} sent"
 
 
+TRAY_LOG = os.path.join(os.path.dirname(CACHE_PATH), "tray-changes.log")
+
+
+def _log_tray(entry: dict) -> None:
+    """One JSON line per tray change, to stdout AND a file on the /data volume —
+    so the record survives container restarts (a restart wiped the evidence
+    for the 9/23 relabel that silently didn't stick)."""
+    entry = {"at": time.strftime("%Y-%m-%d %H:%M:%S"), **entry}
+    line = json.dumps(entry)
+    print("TRAY " + line, flush=True)
+    try:
+        with open(TRAY_LOG, "a") as f:
+            f.write(line + "\n")
+    except OSError as e:
+        print(f"TRAY log write failed: {e}", flush=True)
+
+
+def _tray_label(t: dict) -> str:
+    if not t or not t.get("tray_type"):
+        return "EMPTY/unlabelled"
+    return f'{color_name("#" + t.get("tray_color", "")[:6])} {t["tray_type"]}'
+
+
+def set_tray_verified(printer: str, tray_id: int, material: str, color: str) -> dict:
+    """Relabel an AMS tray and CONFIRM the printer took it: send, then watch the
+    printer's own report until type + color + profile match; resend once if
+    not. Returns {"ok": bool, "message": str}. Never reports success on faith."""
+    prn = _pick(printer)
+    if _is_octo(prn):
+        return {"ok": False, "message": f"{printer} has no AMS trays to set."}
+    name = color.upper()
+    if name not in PALETTE:
+        return {"ok": False, "message": f"Unknown color '{color}'. Palette: {', '.join(PALETTE)}"}
+    mat = material.upper()
+    if mat not in MATERIALS:
+        return {"ok": False, "message": f"Unknown material '{material}'. Materials: {', '.join(MATERIALS)}"}
+    slot = f"slot {tray_id + 1}"
+    if not prn.snapshot().get("connected"):
+        msg = f"{printer} is not connected to the Hub right now, so {slot} was NOT changed. Try again in a minute."
+        _log_tray({"printer": printer, "slot": tray_id + 1, "want": f"{name} {mat}", "ok": False, "why": "not connected"})
+        return {"ok": False, "message": msg}
+
+    info_idx, temp_min, temp_max = MATERIALS[mat]
+    want_hex = PALETTE[name][:6]
+    before = _tray_label(prn.tray_raw(tray_id))
+    state = prn.snapshot().get("state")
+
+    def matches():
+        t = prn.tray_raw(tray_id)
+        return (t.get("tray_type", "").upper() == mat
+                and t.get("tray_color", "")[:6].upper() == want_hex
+                and t.get("tray_info_idx") == info_idx)
+
+    t0 = time.time()
+    ok, attempts = False, 0
+    for attempt in (1, 2):
+        attempts = attempt
+        prn.set_tray(tray_id, mat, PALETTE[name],
+                     temp_min=temp_min, temp_max=temp_max, info_idx=info_idx)
+        if attempt == 2:
+            prn.request({"pushing": {"sequence_id": str(int(time.time())),
+                                     "command": "pushall", "version": 1, "push_target": 1}})
+        deadline = time.time() + 12
+        while time.time() < deadline:
+            if matches():
+                ok = True
+                break
+            time.sleep(0.5)
+        if ok:
+            break
+
+    after = _tray_label(prn.tray_raw(tray_id))
+    secs = round(time.time() - t0, 1)
+    _log_tray({"printer": printer, "slot": tray_id + 1, "want": f"{name} {mat}",
+               "before": before, "after": after, "ok": ok, "attempts": attempts,
+               "seconds": secs, "printer_state": state})
+    if ok:
+        return {"ok": True, "message": f"{printer} {slot} is now {name} {mat} — confirmed by the printer."}
+    return {"ok": False, "message": (f"{printer} did NOT take the change. {slot} still reads {after} "
+                                     f"(sent twice, waited {secs:.0f} s; printer was {state}). "
+                                     f"Try again, or set it on the printer's screen.")}
+
+
 @mcp.tool()
 def set_tray(printer: str, tray_id: int, material: str, color: str) -> str:
     """Register a tray after a spool swap. `material` is PLA/PETG/ABS/ASA/TPU;
     `color` is a palette NAME (GREEN, ORANGE, RED, BLUE, BLACK, WHITE...) — the
     server supplies the exact hex and the material's generic temp profile;
-    nobody ever has to pick or verify a hue by eye."""
-    if _is_octo(_pick(printer)):
-        return f"{printer} has no AMS trays to set."
-    name = color.upper()
-    if name not in PALETTE:
-        return f"Unknown color '{color}'. Palette: {', '.join(PALETTE)}"
-    mat = material.upper()
-    if mat not in MATERIALS:
-        return f"Unknown material '{material}'. Materials: {', '.join(MATERIALS)}"
-    info_idx, temp_min, temp_max = MATERIALS[mat]
-    prn = _pick(printer)
-    prn.set_tray(tray_id, mat, PALETTE[name],
-                 temp_min=temp_min, temp_max=temp_max, info_idx=info_idx)
-    time.sleep(3)
-    return f"tray {tray_id} set to {name} {mat} — verify:\n" + ams_state(printer)
+    nobody ever has to pick or verify a hue by eye. Waits for the printer to
+    confirm the new label and says plainly if it did not stick."""
+    res = set_tray_verified(printer, tray_id, material, color)
+    return ("OK — " if res["ok"] else "FAILED — ") + res["message"] + "\n" + ams_state(printer)
 
 
 @mcp.tool()
@@ -826,8 +898,10 @@ async def _api_action(request: Request):
 async def _api_tray(request: Request):
     body = await request.json()
     name = request.path_params["name"]
-    res = await _run(set_tray, name, int(body["tray_id"]), body["material"], body["color"])
-    return JSONResponse({"result": res})
+    res = await _run(set_tray_verified, name, int(body["tray_id"]), body["material"], body["color"])
+    if not res["ok"]:
+        return JSONResponse({"error": res["message"]}, status_code=409)
+    return JSONResponse({"result": res["message"]})
 
 
 @mcp.custom_route("/api/printer/{name}/delete", methods=["POST"])

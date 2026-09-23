@@ -393,14 +393,22 @@ function askTrayColor(tray, mat, curMat){
 }
 
 async function doTray(tray, mat, color){
-  $('mbody').innerHTML = '<h2>Updating tray…</h2><button class="big" style="width:100%;margin-top:12px" onclick="closeModal()">Back</button>';
+  // The server only answers once the PRINTER confirms the new label (or gives up
+  // after a resend), so this card never claims a change that didn't stick.
+  $('mbody').innerHTML = `<h2>Updating slot ${tray+1}…</h2>
+    <div class="note">Waiting for the printer to confirm ${color} ${mat}. This can take up to 30 seconds.</div>`;
   try{
-    await api(`/api/printer/${CUR}/tray`, {method:'POST',
+    const r = await api(`/api/printer/${CUR}/tray`, {method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({tray_id:tray, material:mat, color})});
-    closeModal();
+      body: JSON.stringify({tray_id:tray, material:mat, color})}, 45000);
+    $('mbody').innerHTML = `<h2>&#10004; Slot ${tray+1} is now ${color} ${mat}</h2>
+      <div class="note">${r.result}</div>
+      <button class="big primary" style="width:100%;margin-top:12px" onclick="closeModal()">OK</button>`;
   }catch(e){
-    errorCard('Could not update tray', e.message);
+    $('mbody').innerHTML = `<h2>&#10006; Slot ${tray+1} was NOT changed</h2>
+      <div class="note">${e.message}</div>
+      <button class="big primary" style="width:100%;margin-top:12px" onclick="doTray(${tray},'${mat}','${color}')">Try again</button>
+      <button class="big" style="width:100%;margin-top:8px" onclick="closeModal()">Close</button>`;
   }
   pview();
 }

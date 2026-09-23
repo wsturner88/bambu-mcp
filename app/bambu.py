@@ -260,6 +260,16 @@ class BambuPrinter:
                                 "type": None, "color": None})
         return out
 
+    def tray_raw(self, tray_id: int) -> dict:
+        """The printer's own last report for one AMS tray (empty dict if none)."""
+        with self._lock:
+            ams = self.state.get("print", {}).get("ams", {})
+            for unit in ams.get("ams", []):
+                for t in unit.get("tray", []):
+                    if int(t.get("id", -1)) == tray_id:
+                        return dict(t)
+        return {}
+
     # ---- actions ---------------------------------------------------------
 
     def start_print(self, filename: str, ams_mapping: list, plate="Metadata/plate_1.gcode"):
